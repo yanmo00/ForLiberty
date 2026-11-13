@@ -9,6 +9,7 @@ import type { AIMessage, AIConfig } from "@/lib/types";
 import Markdown from "react-native-markdown-display";
 import { buildAISnapshot } from "@/lib/ai/data-model";
 import { buildSystemPrompt } from "@/lib/ai/system-prompt";
+import { AI_TOOLS, executeToolCall, type ToolResult } from "@/lib/ai/tools";
 import {
   TOKENHUB_BASE_URL,
   TOKENHUB_CONSOLE_URL,
@@ -62,7 +63,8 @@ function noticeKind(title: string): Notice["kind"] {
 export default function AIScreen() {
   const colors = useColors();
   const router = useRouter();
-  const { state, updateAIConfig, addAIMessage, clearAIMessages } = useApp();
+  const app = useApp();
+  const { state, updateAIConfig, addAIMessage, clearAIMessages } = app;
   const flatListRef = useRef<FlatList>(null);
   
   // 配置状态
@@ -79,12 +81,14 @@ export default function AIScreen() {
 
   const notify = (title: string, text: string) => {
     setNotice({ kind: noticeKind(title), title, text });
-    if (Platform.OS !== "web") notify(title, text);
+    if (Platform.OS !== "web") Alert.alert(title, text);
   };
   
   // 对话状态
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
+  const [toolActions, setToolActions] = useState<{ name: string; args: any; result: ToolResult }[]>([]);
 
   // 当provider变化时更新默认值
   useEffect(() => {
@@ -217,59 +221,115 @@ export default function AIScreen() {
     }
   };
 
-  // 发送消息
+  // 调用聊天补全（带工具）；返回解析后的响应 JSON。withTools=false 时退化为纯对话。
+  const callChat = async (messages: any[], withTools = true): Promise<any> => {
+    const target = `${resolveBaseUrl(state.aiConfig.baseUrl || TOKENHUB_BASE_URL)}/chat/completions`;
+    const body: Record<string, unknown> = {
+      model: state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
+      messages,
+      max_tokens: 2000,
+    };
+    if (withTools) {
+      body.tools = AI_TOOLS;
+      body.tool_choice = "auto";
+    }
+    const response = await fetch(target, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${state.aiConfig.apiKey || ""}`,
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const resBody = await response.text().catch(() => "");
+      let message: string = resBody;
+      try {
+        message = JSON.parse(resBody)?.error?.message || resBody;
+      } catch {
+        // 纯文本错误
+      }
+      throw new Error(`HTTP ${response.status}：${message || response.statusText}`);
+    }
+    return response.json();
+  };
+
+  // 发送消息（支持工具循环：模型可多次调用工具直到达成目标）
   const handleSendMessage = async () => {
     if (!inputText.trim()) return;
     if (!state.aiConfig.isConfigured) {
-      notify("提示", "请先配置API Key");
+      notify("提示", "请先配置 API Key");
       setShowConfig(true);
       return;
     }
 
     const userMessage = inputText.trim();
     setInputText("");
-    
-    // 添加用户消息
     addAIMessage({ role: "user", content: userMessage });
-    
     setIsLoading(true);
+    setToolActions([]);
+
+    const systemPrompt =
+      generateSystemPrompt() +
+      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、添加食物、创建碳循环计划、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么；参数不确定的字段可省略。";
+
     try {
-      // 构建消息历史
-      const messages = [
-        { role: "system", content: generateSystemPrompt() },
-        ...state.aiMessages.slice(-10).map(m => ({ role: m.role, content: m.content })),
+      const conversation: any[] = [
+        { role: "system", content: systemPrompt },
+        ...state.aiMessages.slice(-12).map((m) => ({ role: m.role, content: m.content })),
         { role: "user", content: userMessage },
       ];
 
-      const response = await fetch(`${resolveBaseUrl(state.aiConfig.baseUrl || TOKENHUB_BASE_URL)}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${state.aiConfig.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: state.aiConfig.model,
-          messages,
-          max_tokens: 1000,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const assistantMessage = data.choices[0]?.message?.content || "抱歉，我无法生成回复。";
-        addAIMessage({ role: "assistant", content: assistantMessage });
-      } else {
-        const body = await response.text().catch(() => "");
-        let message: string;
+      let finalText = "";
+      let executedCount = 0;
+      for (let turn = 0; turn < 6; turn++) {
+        let data: any;
         try {
-          message = JSON.parse(body)?.error?.message || body;
-        } catch {
-          message = body;
+          data = await callChat(conversation);
+        } catch (err) {
+          // 首轮若因模型不支持工具而失败，自动退化为纯对话
+          const msg = err instanceof Error ? err.message : String(err);
+          if (turn === 0 && /tool|function|not support|unsupported|参数/i.test(msg)) {
+            data = await callChat(conversation, false);
+          } else {
+            throw err;
+          }
         }
-        addAIMessage({
-          role: "assistant",
-          content: `请求失败：${describeFailure(response.status, message || response.statusText)}`,
-        });
+        const msg = data?.choices?.[0]?.message;
+        if (!msg) break;
+
+        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+          conversation.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
+          for (const tc of msg.tool_calls) {
+            let args: Record<string, any> = {};
+            try {
+              args = JSON.parse(tc.function.arguments || "{}");
+            } catch {
+              args = {};
+            }
+            const result = await executeToolCall(tc.function.name, args, app);
+            executedCount++;
+            setToolActions((prev) => [...prev, { name: tc.function.name, args, result }]);
+            conversation.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: JSON.stringify(result),
+            });
+          }
+          continue; // 带着工具结果再问一次模型
+        }
+
+        finalText = msg.content || "";
+        conversation.push({ role: "assistant", content: finalText });
+        break;
+      }
+
+      if (finalText) {
+        addAIMessage({ role: "assistant", content: finalText });
+      } else if (executedCount > 0) {
+        addAIMessage({ role: "assistant", content: "（已为你执行上述操作）" });
+      } else {
+        addAIMessage({ role: "assistant", content: "抱歉，我暂时无法回应，请稍后再试。" });
       }
     } catch (error) {
       addAIMessage({
@@ -624,6 +684,23 @@ export default function AIScreen() {
             <View className="bg-surface rounded-2xl px-4 py-3 self-start border border-border">
               <ActivityIndicator size="small" color={colors.primary} />
             </View>
+          </View>
+        )}
+
+        {/* AI 本次对话实际执行的写操作（透明展示） */}
+        {toolActions.length > 0 && (
+          <View className="px-5 py-2 border-t border-border bg-surface">
+            <Text className="text-muted text-xs mb-1">AI 本次操作：</Text>
+            {toolActions.map((a, i) => (
+              <View key={i} className="flex-row items-start mb-1">
+                <Text style={{ color: a.result.ok ? "#22c55e" : "#ef4444" }} className="mr-2">
+                  {a.result.ok ? "✅" : "❌"}
+                </Text>
+                <Text className="text-foreground text-xs" style={{ flex: 1 }}>
+                  {a.result.summary}
+                </Text>
+              </View>
+            ))}
           </View>
         )}
 

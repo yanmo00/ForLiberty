@@ -349,7 +349,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
 // Context类型
 type NutritionLogInput = Omit<NutritionLogItem, 'id' | 'loggedAt'> & { date: string };
 
-interface AppContextType {
+export interface AppContextType {
   state: AppState;
   dispatch: React.Dispatch<AppAction>;
   // 便捷方法
