@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Text, View, TouchableOpacity, FlatList, Alert, StyleSheet, ActivityIndicator } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
+import { TrainingDayPicker } from "@/components/training-day-picker";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
 import { useApp } from "@/lib/app-context";
@@ -132,6 +133,12 @@ export default function TemplatesScreen() {
             </View>
           )}
         </View>
+
+        {isActive && (
+          <View style={{ marginBottom: 12 }}>
+            <TrainingDayPicker template={item} onUpdate={updateWorkoutTemplate} />
+          </View>
+        )}
 
         <View style={[styles.actions, { borderTopColor: colors.border }]}>
           <TouchableOpacity style={styles.actionBtn} onPress={() => handleEdit(item.id)}>

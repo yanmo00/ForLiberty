@@ -46,8 +46,16 @@ const PROVIDERS: { value: AIProvider; label: string; defaultUrl: string; default
 // 浏览器有同源策略，网关又不给 CORS 头 → Web 走本机代理，真机直连
 function resolveBaseUrl(url: string): string {
   const base = normalizeBaseUrl(url);
-  return Platform.OS === "web" && base === TOKENHUB_BASE_URL ? TOKENHUB_WEB_PROXY_URL : base;
+  if (Platform.OS !== "web" || base !== TOKENHUB_BASE_URL) return base;
+  // 用页面所在主机拼代理地址：手机用局域网 IP 打开预览时也能连回电脑的代理。
+  // 本机预览时 hostname 是 localhost，行为与写死 127.0.0.1 一致。
+  const hostname =
+    typeof window !== "undefined" && window.location?.hostname ? window.location.hostname : "127.0.0.1";
+  return TOKENHUB_WEB_PROXY_URL.replace("127.0.0.1", hostname);
 }
+
+// 代理的健康检查地址（/__health 在代理根路径，不在 /v1 下）
+const PROXY_HEALTH_URL = TOKENHUB_WEB_PROXY_URL.replace(/\/v1\/?$/, "") + "/__health";
 
 function describeFailure(status: number, body: string): string {
   const lower = body.toLowerCase();
@@ -60,10 +68,50 @@ function describeFailure(status: number, body: string): string {
   return `HTTP ${status}：${body.slice(0, 160)}`;
 }
 
-function describeNetworkError(msg: string): string {
-  if (/failed to fetch|network request failed|load failed|networkerror/i.test(msg))
-    return "浏览器跨域被拦，或本机代理没启动。Web 预览请用 npm run dev:web 启动（含代理）；手机 App 不受此限制。";
-  return `连接错误：${msg}`;
+// 只判断代理端口在不在监听；no-cors 可避开 CORS 头干扰（局域网 IP 打开时也能测）。
+async function pingProxy(): Promise<boolean> {
+  if (Platform.OS !== "web") return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    await fetch(PROXY_HEALTH_URL, { mode: "no-cors", signal: controller.signal });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 网络抖动（Failed to fetch / 超时）自动重试一次；HTTP 401/429/404 不重试，不浪费额度。
+async function fetchWithRetry(url: string, init: RequestInit, retries = 1): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fetch(url, init);
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+// 分诊：以前任何网络失败都甩「浏览器跨域/代理没启动」，真机断网也这么报，纯属误导。
+async function diagnoseNetworkError(msg: string): Promise<string> {
+  const networkish = /failed to fetch|network request failed|load failed|networkerror|timeout|aborted|network/i.test(msg);
+  if (Platform.OS !== "web") {
+    return networkish
+      ? "手机连不上网关：检查联网后重试；真机直连官方域名，不需要启动本机代理。持续失败就点「测试连接」看状态码。"
+      : `连接错误：${msg}`;
+  }
+  const alive = await pingProxy();
+  if (!alive) {
+    return "本机代理没启动（或已退出 / 8082 被占用）。关掉预览，重新运行 npm run dev:web 一次启动代理+预览；只用 npx expo start --web 不会有代理。";
+  }
+  return networkish
+    ? "本机代理在线，但这次请求仍失败：多为网关偶发超时或断网（已自动重试一次）。可点「测试连接」看具体状态码；若用局域网 IP 打开预览，改用 http://localhost:8081。"
+    : `连接错误：${msg}`;
 }
 
 // 待发送的图片：uri 是 data URI（base64），只放内存，不写进持久化消息。
@@ -146,10 +194,28 @@ export default function AIScreen() {
   const [topOffset, setTopOffset] = useState(0);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
+  // Web 预览时本机代理是否在线：一眼能看出「请求失败」是不是代理没起导致的
+  const [proxyAlive, setProxyAlive] = useState<boolean | null>(null);
 
   useEffect(() => {
     messagesRef.current = state.aiMessages;
   }, [state.aiMessages]);
+
+  useEffect(() => {
+    if (Platform.OS !== "web") return;
+    let mounted = true;
+    const check = () => {
+      pingProxy().then((ok) => {
+        if (mounted) setProxyAlive(ok);
+      });
+    };
+    check();
+    const timer = setInterval(check, 15000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
     // Web 没有 RN 的 Keyboard 事件，用 visualViewport 判断浏览器虚拟键盘/缩放挤占的高度
@@ -263,7 +329,7 @@ export default function AIScreen() {
     setIsTesting(true);
     setNotice(null);
     try {
-      const response = await fetch(target, {
+      const response = await fetchWithRetry(target, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -311,7 +377,7 @@ export default function AIScreen() {
         );
       }
     } catch (error) {
-      notify("错误 · 测试连接未通过", describeNetworkError(error instanceof Error ? error.message : "未知错误"));
+      notify("错误 · 测试连接未通过", await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误"));
     } finally {
       setIsTesting(false);
     }
@@ -325,7 +391,7 @@ export default function AIScreen() {
       return;
     }
     try {
-      const response = await fetch(`${resolveBaseUrl(baseUrl)}/models`, {
+      const response = await fetchWithRetry(`${resolveBaseUrl(baseUrl)}/models`, {
         headers: { "Authorization": `Bearer ${effectiveKey}` },
       });
       const body = await response.text().catch(() => "");
@@ -340,7 +406,7 @@ export default function AIScreen() {
       }
       setModelList(ids.slice(0, 20));
     } catch (error) {
-      notify("错误", describeNetworkError(error instanceof Error ? error.message : "未知错误"));
+      notify("错误", await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误"));
     }
   };
 
@@ -381,7 +447,7 @@ export default function AIScreen() {
       body.tools = AI_TOOLS;
       body.tool_choice = "auto";
     }
-    const response = await fetch(target, {
+    const response = await fetchWithRetry(target, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -473,7 +539,7 @@ export default function AIScreen() {
           const raw = err instanceof Error ? err.message : String(err);
           const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404/i.test(raw)
             ? `当前模型可能不支持图片。到「高级设置 → 视觉模型」填一个支持视觉的 ID（点「查模型名」从 /v1/models 找带 vl / vision 的，例如 ${TOKENHUB_VISION_MODEL_EXAMPLE}）再重发。`
-            : describeNetworkError(raw);
+            : await diagnoseNetworkError(raw);
           notify("失败 · 图片识别未完成", `${raw}\n${hint}`);
           addAIMessage({ role: "assistant", content: `图片识别失败：${hint}` });
           return; // 用户图片消息已保存，不会消失；finally 会收尾
@@ -557,7 +623,7 @@ export default function AIScreen() {
     } catch (error) {
       addAIMessage({
         role: "assistant",
-        content: `请求失败：${describeNetworkError(error instanceof Error ? error.message : "未知错误")}`,
+        content: `请求失败：${await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误")}`,
       });
     } finally {
       setIsLoading(false);
@@ -709,11 +775,20 @@ export default function AIScreen() {
         <View className="flex-row items-center flex-1 mr-3">
           <View
             className="w-2 h-2 rounded-full mr-2"
-            style={{ backgroundColor: state.aiConfig.isConfigured ? "#22c55e" : "#f59e0b" }}
+            style={{
+              backgroundColor:
+                Platform.OS === "web" && proxyAlive === false
+                  ? "#ef4444"
+                  : state.aiConfig.isConfigured
+                  ? "#22c55e"
+                  : "#f59e0b",
+            }}
           />
           <Text className="text-muted text-xs" numberOfLines={1}>
             {state.aiConfig.isConfigured
-              ? `已配置 · ${state.aiConfig.model || TOKENHUB_DEFAULT_MODEL} · ${Platform.OS === "web" ? "本机代理" : "直连"}`
+              ? `已配置 · ${Platform.OS === "web"
+                  ? proxyAlive === false ? "代理未启动" : proxyAlive ? "代理在线" : "代理检测中"
+                  : "直连"} · ${state.aiConfig.model || TOKENHUB_DEFAULT_MODEL}`
               : "未配置 API Key"}
           </Text>
         </View>
@@ -728,6 +803,18 @@ export default function AIScreen() {
           </Text>
         </TouchableOpacity>
       </View>
+
+      {/* 代理没起时先给一条可执行的修复提示，别等请求失败才猜 */}
+      {Platform.OS === "web" && proxyAlive === false && (
+        <View
+          className="mx-5 mt-2 rounded-lg px-3 py-2"
+          style={{ backgroundColor: "rgba(239,68,68,0.10)", borderColor: "rgba(239,68,68,0.4)", borderWidth: 1 }}
+        >
+          <Text className="text-foreground text-xs leading-5">
+            本机代理未启动：关掉预览，运行 npm run dev:web 一次启动「代理 8082 + 预览 8081」；只跑 npx expo start --web 不会有代理。
+          </Text>
+        </View>
+      )}
 
       {/* 结果条：所有操作反馈都在这里可见，Web 的 Alert.alert 是空函数。
           键盘弹起时也必须保留，否则「已复制 / 已粘贴」这类反馈会看不见。 */}

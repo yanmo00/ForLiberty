@@ -1,6 +1,7 @@
 import { ScrollView, Text, View, TouchableOpacity, ActivityIndicator } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
+import { TrainingDayPicker } from "@/components/training-day-picker";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
 import { useApp } from "@/lib/app-context";
@@ -13,7 +14,7 @@ import { generateDailyTips } from "@/lib/ai/insights";
 export default function TrainingScreen() {
   const colors = useColors();
   const router = useRouter();
-  const { state, startWorkoutSession } = useApp();
+  const { state, startWorkoutSession, updateWorkoutTemplate } = useApp();
 
   if (state.isLoading) {
     return (
@@ -115,6 +116,12 @@ export default function TrainingScreen() {
                 <Text className="text-primary">管理模板</Text>
               </TouchableOpacity>
             </View>
+
+            {activeTemplate && (
+              <View className="mb-3">
+                <TrainingDayPicker template={activeTemplate} onUpdate={updateWorkoutTemplate} />
+              </View>
+            )}
 
             {!activeTemplate ? (
               <View className="items-center py-4">

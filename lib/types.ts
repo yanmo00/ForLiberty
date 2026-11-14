@@ -72,6 +72,9 @@ export interface TemplateSchedule {
   trainingDaysPerWeek: number;
   restDaysBetweenCycles: number;
   startDate?: string;
+  // 手动改「当前第几天」留下的偏移。0 = 完全按 startDate 自动推算；
+  // 改一次后后续每天仍自动往后推进，不会永远钉在同一天。
+  dayOffset?: number;
 }
 
 export interface WorkoutSessionPlan {

@@ -170,6 +170,7 @@ export default function TemplateEditorScreen() {
         trainingDaysPerWeek: trainingDays,
         restDaysBetweenCycles: restDays,
         startDate: editingTemplate?.schedule.startDate || getTodayString(),
+        dayOffset: editingTemplate?.schedule.dayOffset ?? 0,
       },
       updatedAt: new Date().toISOString(),
       createdAt: editingTemplate?.createdAt || new Date().toISOString(),

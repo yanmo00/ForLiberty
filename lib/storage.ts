@@ -208,6 +208,8 @@ function normalizeWorkoutTemplate(template: any, exercises: Exercise[]): Workout
     trainingDaysPerWeek,
     restDaysBetweenCycles: restDaysBetweenCycles < 0 ? 0 : restDaysBetweenCycles,
     startDate: template.schedule?.startDate ?? template.startDate,
+    // 手动切换「当前第几天」的偏移必须保留，否则重载后进度会被重置
+    dayOffset: Number(template.schedule?.dayOffset ?? 0) || 0,
   };
 
   return {

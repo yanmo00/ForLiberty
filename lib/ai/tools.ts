@@ -459,6 +459,13 @@ export async function executeToolCall(
         );
         if (!tpl) return { ok: false, summary: `找不到训练计划：${args.templateName}` };
         await app.updateUserProfile({ activeWorkoutTemplateId: tpl.id });
+        // 缺 startDate 时周期推算会一直以「今天」为锚点，训练日永远停在第 1 天
+        if (!tpl.schedule?.startDate) {
+          await app.updateWorkoutTemplate({
+            ...tpl,
+            schedule: { ...tpl.schedule, startDate: getTodayString() },
+          });
+        }
         return { ok: true, summary: `已设为当前计划：「${tpl.name}」` };
       }
 
