@@ -28,7 +28,9 @@ function readBody(req) {
     let size = 0;
     req.on("data", (c) => {
       size += c.length;
-      if (size > 2 * 1024 * 1024) {
+      // 图片识别会把 base64 塞进请求体，一张压缩后的照片约 1–6MB；放宽到 20MB。
+      // 上游 host 仍写死、只透传必要头，放宽体积不会扩大攻击面。
+      if (size > 20 * 1024 * 1024) {
         reject(new Error("body too large"));
         req.destroy();
         return;

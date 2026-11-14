@@ -210,7 +210,17 @@ export interface AIConfig {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+  // 图片识别用的视觉模型；留空则复用上面的主模型（多数纯文本模型不支持图片）。
+  visionModel?: string;
   isConfigured: boolean;
+}
+
+// 聊天消息里附带的图片元信息。
+// 不存 base64：图片本体只放在当次会话的内存里，避免 AsyncStorage 被大图撑爆；
+// 持久化的「数据记录」是 imageAnalysis（AI 识别出的文字结果）。
+export interface AIMessageImage {
+  name?: string;
+  mimeType: string;
 }
 
 // AI消息
@@ -219,6 +229,9 @@ export interface AIMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: string;
+  image?: AIMessageImage;
+  // 图片识别结果：作为上下文参与回复，并随消息持久化/导出备份。
+  imageAnalysis?: string;
 }
 
 // 训练目标

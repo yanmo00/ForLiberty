@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useReducer, useEffect, useCallback, type ReactNode } from 'react';
+import React, { createContext, useContext, useReducer, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import type {
   Exercise,
   WorkoutTemplate,
@@ -96,6 +96,7 @@ type AppAction =
   | { type: 'DELETE_CARB_CYCLE_PLAN'; payload: string }
   | { type: 'UPDATE_AI_CONFIG'; payload: Partial<AIConfig> }
   | { type: 'ADD_AI_MESSAGE'; payload: AIMessage }
+  | { type: 'UPDATE_AI_MESSAGE'; payload: { id: string; patch: Partial<AIMessage> } }
   | { type: 'CLEAR_AI_MESSAGES' }
   | {
       type: 'START_WORKOUT_SESSION';
@@ -129,8 +130,19 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case 'SET_LOADING':
       return { ...state, isLoading: action.payload };
 
-    case 'LOAD_ALL_DATA':
-      return { ...state, ...action.payload, isLoading: false };
+    case 'LOAD_ALL_DATA': {
+      // 异步加载完成前用户可能已经发了消息；后到的磁盘快照不能把这几条新消息冲掉。
+      // 按 id 合并：磁盘历史在前，内存里多出来的新消息按原顺序追加在后面。
+      const incoming = action.payload.aiMessages ?? [];
+      const known = new Set(incoming.map((m) => m.id));
+      const pending = state.aiMessages.filter((m) => !known.has(m.id));
+      return {
+        ...state,
+        ...action.payload,
+        aiMessages: pending.length ? [...incoming, ...pending] : incoming,
+        isLoading: false,
+      };
+    }
 
     case 'UPDATE_USER_PROFILE':
       return { ...state, userProfile: { ...state.userProfile, ...action.payload } };
@@ -273,6 +285,14 @@ function appReducer(state: AppState, action: AppAction): AppState {
     case 'ADD_AI_MESSAGE':
       return { ...state, aiMessages: [...state.aiMessages, action.payload] };
 
+    case 'UPDATE_AI_MESSAGE':
+      return {
+        ...state,
+        aiMessages: state.aiMessages.map((m) =>
+          m.id === action.payload.id ? { ...m, ...action.payload.patch } : m
+        ),
+      };
+
     case 'CLEAR_AI_MESSAGES':
       return { ...state, aiMessages: [] };
 
@@ -381,7 +401,9 @@ export interface AppContextType {
   deleteBodyMetric: (id: string) => Promise<void>;
   updateExerciseAbility: (ability: ExerciseAbility) => Promise<void>;
   updateAIConfig: (config: Partial<AIConfig>) => Promise<void>;
-  addAIMessage: (message: Omit<AIMessage, 'id' | 'timestamp'>) => void;
+  // 返回落库后的完整消息，便于调用方把图片预览等临时数据挂到这条消息上。
+  addAIMessage: (message: Omit<AIMessage, 'id' | 'timestamp'>) => AIMessage;
+  updateAIMessage: (id: string, patch: Partial<AIMessage>) => void;
   clearAIMessages: () => Promise<void>;
   getExerciseById: (id: string) => Exercise | undefined;
   getSessionsByDate: (date: string) => WorkoutSession[];
@@ -395,6 +417,20 @@ const AppContext = createContext<AppContextType | null>(null);
 // Provider组件
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState);
+  // AI 消息统一由这个 effect 串行落盘。以前每个 addAIMessage 各自读闭包里的
+  // state.aiMessages 拼数组再写，一轮对话里「用户消息」和「AI 回复」两次写会互相覆盖，
+  // 导致用户消息在持久化里丢失（重进页面就消失）。改成单一写入点后彻底消除竞态。
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    if (state.isLoading) return;
+    const snapshot = state.aiMessages;
+    saveChainRef.current = saveChainRef.current
+      .then(() => saveAIMessages(snapshot))
+      .catch((error) => {
+        console.error('Error saving AI messages:', error);
+      });
+  }, [state.aiMessages, state.isLoading]);
 
   // 加载所有数据
   useEffect(() => {
@@ -733,21 +769,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     await saveAIConfig({ ...state.aiConfig, ...config });
   }, [state.aiConfig]);
 
-  const addAIMessage = useCallback((message: Omit<AIMessage, 'id' | 'timestamp'>) => {
+  // 只 dispatch，不再自己拼数组落盘（持久化统一交给上面的 effect）。
+  // 依赖数组为空 → 函数引用稳定，调用方不会读到过期的消息快照。
+  const addAIMessage = useCallback((message: Omit<AIMessage, 'id' | 'timestamp'>): AIMessage => {
     const newMessage: AIMessage = {
       ...message,
       id: generateId(),
       timestamp: new Date().toISOString(),
     };
     dispatch({ type: 'ADD_AI_MESSAGE', payload: newMessage });
-    saveAIMessages([...state.aiMessages, newMessage]).catch((error) => {
-      console.error('Error saving AI messages:', error);
-    });
-  }, [state.aiMessages]);
+    return newMessage;
+  }, []);
+
+  const updateAIMessage = useCallback((id: string, patch: Partial<AIMessage>) => {
+    dispatch({ type: 'UPDATE_AI_MESSAGE', payload: { id, patch } });
+  }, []);
 
   const clearAIMessages = useCallback(async () => {
     dispatch({ type: 'CLEAR_AI_MESSAGES' });
-    await saveAIMessages([]);
   }, []);
 
   const getExerciseById = useCallback((id: string) => {
@@ -798,6 +837,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     updateExerciseAbility,
     updateAIConfig,
     addAIMessage,
+    updateAIMessage,
     clearAIMessages,
     getExerciseById,
     getSessionsByDate,

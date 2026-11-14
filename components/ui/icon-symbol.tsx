@@ -36,6 +36,10 @@ const MAPPING = {
   "trash.fill": "delete",
   "pencil": "edit",
   "pencil.circle.fill": "edit",
+  // 图片上传 / 复制 / 粘贴
+  "photo": "photo",
+  "square.on.square": "content-copy",
+  "doc.on.clipboard": "content-paste",
   // Timer icons
   "play.fill": "play-arrow",
   "pause.fill": "pause",

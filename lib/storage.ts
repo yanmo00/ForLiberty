@@ -380,7 +380,28 @@ export async function saveAIMessages(messages: AIMessage[]): Promise<void> {
 }
 
 export async function loadAIMessages(): Promise<AIMessage[]> {
-  return getItem(STORAGE_KEYS.AI_MESSAGES, []);
+  const stored = await getItem<AIMessage[]>(STORAGE_KEYS.AI_MESSAGES, []);
+  if (!Array.isArray(stored)) return [];
+  // 旧版本或导入的备份可能缺 id / 字段异常。FlatList 用 id 做 key，
+  // 缺 id 或重复 id 会让消息渲染错乱甚至不显示，这里统一补全并过滤脏数据。
+  const seen = new Set<string>();
+  return stored
+    .filter(
+      (m): m is AIMessage =>
+        !!m &&
+        typeof m.content === 'string' &&
+        (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
+    )
+    .map((m) => {
+      let id = m.id;
+      if (!id || seen.has(id)) id = generateId();
+      seen.add(id);
+      return {
+        ...m,
+        id,
+        timestamp: m.timestamp || new Date().toISOString(),
+      };
+    });
 }
 
 // 当前训练会话
@@ -527,8 +548,11 @@ export async function clearAllData(): Promise<void> {
 }
 
 // 生成唯一ID
+// 加自增序号：同一毫秒内连续发多条消息也不会撞 ID（FlatList 用 id 做 key，撞了会漏渲染）。
+let idCounter = 0;
 export function generateId(): string {
-  return `${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  idCounter = (idCounter + 1) % 1000000;
+  return `${Date.now()}_${idCounter}_${Math.random().toString(36).substring(2, 9)}`;
 }
 
 // 获取今天的日期字符串 (YYYY-MM-DD)

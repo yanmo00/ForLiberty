@@ -1,5 +1,19 @@
 import { useState, useRef, useEffect, useMemo } from "react";
-import { Text, View, TouchableOpacity, TextInput, FlatList, Alert, ActivityIndicator, KeyboardAvoidingView, Platform } from "react-native";
+import {
+  Text,
+  View,
+  TouchableOpacity,
+  TextInput,
+  FlatList,
+  Alert,
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Keyboard,
+  Platform,
+  Image,
+} from "react-native";
+import * as Clipboard from "expo-clipboard";
+import * as ImagePicker from "expo-image-picker";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
@@ -15,6 +29,7 @@ import {
   TOKENHUB_CONSOLE_URL,
   TOKENHUB_DEFAULT_MODEL,
   TOKENHUB_WEB_PROXY_URL,
+  TOKENHUB_VISION_MODEL_EXAMPLE,
   normalizeBaseUrl,
 } from "@/constants/ai-provider";
 
@@ -51,6 +66,37 @@ function describeNetworkError(msg: string): string {
   return `连接错误：${msg}`;
 }
 
+// 待发送的图片：uri 是 data URI（base64），只放内存，不写进持久化消息。
+type PendingImage = { uri: string; name?: string; mimeType: string };
+// 单张图片上限，超过就提示换小图，避免请求体过大被网关/代理拒掉。
+const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+
+// 把选图结果统一转成 data URI。真机由 expo-image-picker 直接给 base64；
+// Web 若拿不到 base64，则用 FileReader 从 blob URI 读一份。
+async function toDataUri(asset: {
+  uri: string;
+  base64?: string | null;
+  mimeType?: string;
+  fileName?: string | null;
+}): Promise<{ uri: string; mimeType: string; name?: string }> {
+  const mimeType = asset.mimeType || "image/jpeg";
+  const name = asset.fileName ?? undefined;
+  if (asset.base64) {
+    return { uri: `data:${mimeType};base64,${asset.base64}`, mimeType, name };
+  }
+  const res = await fetch(asset.uri);
+  const blob = await res.blob();
+  const Reader = (globalThis as any).FileReader;
+  if (!Reader) throw new Error("当前环境不支持读取图片");
+  const dataUri = await new Promise<string>((resolve, reject) => {
+    const reader = new Reader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error("读取图片失败"));
+    reader.readAsDataURL(blob);
+  });
+  return { uri: dataUri, mimeType: blob.type || mimeType, name };
+}
+
 // react-native-web 的 Alert.alert 是空函数，Web 上点了完全没反应。
 // 所有反馈改成页面内可见的结果条；真机仍额外弹原生 Alert。
 type Notice = { kind: "success" | "error" | "info"; title: string; text: string };
@@ -64,14 +110,19 @@ export default function AIScreen() {
   const colors = useColors();
   const router = useRouter();
   const app = useApp();
-  const { state, updateAIConfig, addAIMessage, clearAIMessages } = app;
+  const { state, updateAIConfig, addAIMessage, updateAIMessage, clearAIMessages } = app;
   const flatListRef = useRef<FlatList>(null);
-  
+  // 图片本体只存内存：持久化消息里只放识别文字，避免大 base64 撑爆 AsyncStorage。
+  const imagePreviews = useRef<Record<string, string>>({});
+  // 最新消息镜像：构建模型上下文时不再依赖渲染闭包里的旧 state。
+  const messagesRef = useRef<AIMessage[]>(state.aiMessages);
+
   // 配置状态
   const [showConfig, setShowConfig] = useState(!state.aiConfig.isConfigured);
   const [provider, setProvider] = useState<AIProvider>(state.aiConfig.provider || "tokenhub");
   const [baseUrl, setBaseUrl] = useState(state.aiConfig.baseUrl || TOKENHUB_BASE_URL);
   const [model, setModel] = useState(state.aiConfig.model || TOKENHUB_DEFAULT_MODEL);
+  const [visionModel, setVisionModel] = useState(state.aiConfig.visionModel || "");
   // 已保存的 Key 永不回显到输入框；留空表示沿用旧 Key
   const [apiKey, setApiKey] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -83,12 +134,108 @@ export default function AIScreen() {
     setNotice({ kind: noticeKind(title), title, text });
     if (Platform.OS !== "web") Alert.alert(title, text);
   };
-  
+
   // 对话状态
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
   // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
   const [toolActions, setToolActions] = useState<{ name: string; args: any; result: ToolResult }[]>([]);
+
+  // 软键盘：KAV 上方固定内容的高度、键盘是否弹起、键盘占掉的高度
+  const [topOffset, setTopOffset] = useState(0);
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
+
+  useEffect(() => {
+    messagesRef.current = state.aiMessages;
+  }, [state.aiMessages]);
+
+  useEffect(() => {
+    // Web 没有 RN 的 Keyboard 事件，用 visualViewport 判断浏览器虚拟键盘/缩放挤占的高度
+    if (Platform.OS === "web") {
+      const vv = (globalThis as any).visualViewport;
+      if (!vv) return;
+      const onResize = () => {
+        const overlap = Math.max(0, (globalThis as any).innerHeight - vv.height - vv.offsetTop);
+        setKeyboardHeight(overlap > 80 ? overlap : 0);
+        setKeyboardVisible(overlap > 80);
+      };
+      vv.addEventListener?.("resize", onResize);
+      return () => vv.removeEventListener?.("resize", onResize);
+    }
+    const show = Keyboard.addListener("keyboardDidShow", (e) => {
+      setKeyboardHeight(e.endCoordinates.height);
+      setKeyboardVisible(true);
+      // 键盘弹出后把最后一条消息滚到可视区，避免被键盘盖住
+      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 120);
+    });
+    const hide = Keyboard.addListener("keyboardDidHide", () => {
+      setKeyboardHeight(0);
+      setKeyboardVisible(false);
+    });
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  // 选图：只做本地读取，不发请求；发送时才识别
+  const handlePickImage = async () => {
+    try {
+      if (Platform.OS !== "web") {
+        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!perm.granted) {
+          notify("错误 · 无相册权限", "请在系统设置里允许 FitLife 访问相册。");
+          return;
+        }
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: "images",
+        allowsEditing: false,
+        quality: 0.4,
+        base64: true,
+      });
+      if (result.canceled || !result.assets?.length) return;
+      const picked = await toDataUri(result.assets[0]);
+      const base64Part = picked.uri.split(",")[1] || "";
+      if (base64Part.length * 0.75 > MAX_IMAGE_BYTES) {
+        notify("错误 · 图片过大", "这张图太大，换一张小图或截图再试（建议压缩后小于 4MB）。");
+        return;
+      }
+      setPendingImage({ uri: picked.uri, mimeType: picked.mimeType, name: picked.name });
+      notify("提示 · 已选择图片", "可以补一句想问什么，直接点发送就开始识别。");
+    } catch (error) {
+      notify("错误 · 选图失败", error instanceof Error ? error.message : "未知错误");
+    }
+  };
+
+  // 复制：AI 回复气泡下的「复制」按钮
+  const handleCopy = async (text: string) => {
+    try {
+      await Clipboard.setStringAsync(text);
+      notify("成功 · 已复制", `已复制 ${text.length} 个字符到剪贴板`);
+    } catch {
+      notify("错误 · 复制失败", "当前环境不允许写入剪贴板，可长按文本复制。");
+    }
+  };
+
+  // 粘贴：输入框旁的显式按钮；长按输入框的系统粘贴仍然可用
+  const handlePaste = async () => {
+    try {
+      const text = await Clipboard.getStringAsync();
+      if (!text) {
+        notify("提示", "剪贴板里没有文本");
+        return;
+      }
+      setInputText((prev) => {
+        const joined = prev ? `${prev}${prev.endsWith("\n") ? "" : "\n"}${text}` : text;
+        return joined.slice(0, 1000);
+      });
+    } catch {
+      notify("错误 · 粘贴失败", "当前环境不允许读取剪贴板，可用输入框长按粘贴。");
+    }
+  };
 
   // 当provider变化时更新默认值
   useEffect(() => {
@@ -211,6 +358,7 @@ export default function AIScreen() {
         baseUrl: normalizeBaseUrl(baseUrl),
         apiKey: effectiveKey,
         model: model || TOKENHUB_DEFAULT_MODEL,
+        visionModel: visionModel.trim() || undefined,
         isConfigured: true,
       });
       setApiKey(""); // 立刻清掉输入框，不留在屏幕上
@@ -222,10 +370,10 @@ export default function AIScreen() {
   };
 
   // 调用聊天补全（带工具）；返回解析后的响应 JSON。withTools=false 时退化为纯对话。
-  const callChat = async (messages: any[], withTools = true): Promise<any> => {
+  const callChat = async (messages: any[], withTools = true, modelOverride?: string): Promise<any> => {
     const target = `${resolveBaseUrl(state.aiConfig.baseUrl || TOKENHUB_BASE_URL)}/chat/completions`;
     const body: Record<string, unknown> = {
-      model: state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
+      model: modelOverride || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
       messages,
       max_tokens: 2000,
     };
@@ -254,30 +402,105 @@ export default function AIScreen() {
     return response.json();
   };
 
-  // 发送消息（支持工具循环：模型可多次调用工具直到达成目标）
+  // 图片识别：单独一次纯视觉请求（不带工具），拿到的文字作为上下文喂给主对话，
+  // 同时写回该条用户消息的 imageAnalysis 字段，作为可持久化的「识别数据记录」。
+  const recognizeImage = async (dataUri: string, question: string): Promise<string> => {
+    const vision = (state.aiConfig.visionModel || "").trim();
+    const messages = [
+      {
+        role: "system",
+        content:
+          "你是图片识别助手。用中文客观描述图片内容，只写看得清的内容，不要编造数字。" +
+          "若是食物/餐盘：逐项列出食物、估算份量(g)、热量(kcal)与蛋白/碳水/脂肪(g)。" +
+          "若是体脂秤或体测报告：逐项抄录体重、体脂率、BMI、肌肉量等数值与单位。" +
+          "若是训练计划表：列出动作、组数、次数、重量。最后给一行『可记录数据：…』摘要。",
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: question || "请识别这张图片，并把其中可记录的数据逐项列出来。" },
+          { type: "image_url", image_url: { url: dataUri } },
+        ],
+      },
+    ];
+    const data = await callChat(messages, false, vision || undefined);
+    const text = String(data?.choices?.[0]?.message?.content ?? "").trim();
+    if (!text) throw new Error("视觉模型没有返回识别结果");
+    return text;
+  };
+
+  // 发送消息（支持图片识别 + 工具循环：模型可多次调用工具直到达成目标）
   const handleSendMessage = async () => {
-    if (!inputText.trim()) return;
+    const text = inputText.trim();
+    const image = pendingImage;
+    if (!text && !image) return;
     if (!state.aiConfig.isConfigured) {
       notify("提示", "请先配置 API Key");
       setShowConfig(true);
       return;
     }
 
-    const userMessage = inputText.trim();
+    // 先把用户消息落库再发请求：即使后续识别/回话失败，这条也不会消失。
+    const userContent = text || "请识别这张图片并给出要点";
+    const userMsg = addAIMessage({
+      role: "user",
+      content: userContent,
+      ...(image ? { image: { name: image.name, mimeType: image.mimeType } } : {}),
+    });
+    if (image) imagePreviews.current[userMsg.id] = image.uri;
+    messagesRef.current = [...messagesRef.current, userMsg];
+
     setInputText("");
-    addAIMessage({ role: "user", content: userMessage });
+    setPendingImage(null);
     setIsLoading(true);
     setToolActions([]);
 
     const systemPrompt =
       generateSystemPrompt() +
-      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、添加食物、创建碳循环计划、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么；参数不确定的字段可省略。";
+      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、添加食物、创建碳循环计划、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么；参数不确定的字段可省略。" +
+      (image
+        ? "\n\n[图片] 本轮消息里已附上「图片识别结果」。把它当作事实上下文来回答；其中若有食物热量、体测数值或训练组次，请调用对应工具保存，并在回复里说明存了什么。"
+        : "");
 
     try {
+      let contextText = userContent;
+
+      if (image) {
+        let analysis: string;
+        try {
+          analysis = await recognizeImage(image.uri, text);
+        } catch (err) {
+          const raw = err instanceof Error ? err.message : String(err);
+          const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404/i.test(raw)
+            ? `当前模型可能不支持图片。到「高级设置 → 视觉模型」填一个支持视觉的 ID（点「查模型名」从 /v1/models 找带 vl / vision 的，例如 ${TOKENHUB_VISION_MODEL_EXAMPLE}）再重发。`
+            : describeNetworkError(raw);
+          notify("失败 · 图片识别未完成", `${raw}\n${hint}`);
+          addAIMessage({ role: "assistant", content: `图片识别失败：${hint}` });
+          return; // 用户图片消息已保存，不会消失；finally 会收尾
+        }
+        // 识别结果写回这条消息 → 随聊天记录持久化/导出，就是「对应数据记录」
+        updateAIMessage(userMsg.id, { imageAnalysis: analysis });
+        messagesRef.current = messagesRef.current.map((m) =>
+          m.id === userMsg.id ? { ...m, imageAnalysis: analysis } : m
+        );
+        contextText = [
+          text || "请分析这张图片",
+          "",
+          "[图片识别结果（已保存到对话记录）]",
+          analysis,
+          "",
+          "请基于以上识别结果回答。若其中包含可记录的数据（食物热量、体测数值、训练组次等），请调用对应工具保存，并在回复里说明存了什么。",
+        ].join("\n");
+      }
+
       const conversation: any[] = [
         { role: "system", content: systemPrompt },
-        ...state.aiMessages.slice(-12).map((m) => ({ role: m.role, content: m.content })),
-        { role: "user", content: userMessage },
+        // 用最新消息镜像，避免闭包里的旧 state 丢掉刚发的消息
+        ...messagesRef.current
+          .slice(-12)
+          .filter((m) => m.id !== userMsg.id)
+          .map((m) => ({ role: m.role, content: m.content })),
+        { role: "user", content: contextText },
       ];
 
       let finalText = "";
@@ -400,27 +623,69 @@ export default function AIScreen() {
     link: { color: colors.primary },
   }), [colors]);
 
-  const renderMessage = ({ item }: { item: AIMessage }) => (
-    <View className={`mb-3 ${item.role === "user" ? "items-end" : "items-start"}`}>
-      <View
-        className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-          item.role === "user" ? "bg-primary" : "bg-surface border border-border"
-        }`}
-      >
-        {item.role === "user" ? (
-          <Text className="text-background">{item.content}</Text>
-        ) : (
-          <Markdown style={markdownStyles}>{item.content}</Markdown>
-        )}
+  const renderMessage = ({ item }: { item: AIMessage }) => {
+    const previewUri = imagePreviews.current[item.id];
+    const isUser = item.role === "user";
+    return (
+      <View className={`mb-3 ${isUser ? "items-end" : "items-start"}`}>
+        <View
+          className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+            isUser ? "bg-primary" : "bg-surface border border-border"
+          }`}
+        >
+          {item.image &&
+            (previewUri ? (
+              <Image
+                source={{ uri: previewUri }}
+                style={{ width: 200, height: 150, borderRadius: 10, marginBottom: 8 }}
+                resizeMode="cover"
+              />
+            ) : (
+              <View className="flex-row items-center mb-2">
+                <IconSymbol name="photo" size={16} color={isUser ? colors.background : colors.muted} />
+                <Text className={`text-xs ml-2 ${isUser ? "text-background" : "text-muted"}`} numberOfLines={1}>
+                  {item.image.name || "图片（识别结果已保存）"}
+                </Text>
+              </View>
+            ))}
+          {isUser ? (
+            <Text className="text-background">{item.content}</Text>
+          ) : (
+            <Markdown style={markdownStyles}>{item.content}</Markdown>
+          )}
+          {item.imageAnalysis ? (
+            <View className={`mt-2 pt-2 border-t ${isUser ? "border-background/30" : "border-border"}`}>
+              <Text className={`text-xs font-semibold mb-1 ${isUser ? "text-background" : "text-muted"}`}>
+                📷 识别结果（已保存）
+              </Text>
+              <Text
+                className={`text-xs leading-5 ${isUser ? "text-background" : "text-foreground"}`}
+                numberOfLines={6}
+              >
+                {item.imageAnalysis}
+              </Text>
+            </View>
+          ) : null}
+        </View>
+        <View className="flex-row items-center mt-1 px-2">
+          <Text className="text-muted text-xs">
+            {new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
+          </Text>
+          {item.role === "assistant" && (
+            <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
+              <IconSymbol name="square.on.square" size={13} color={colors.muted} />
+              <Text className="text-muted text-xs ml-1">复制</Text>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
-      <Text className="text-muted text-xs mt-1 px-2">
-        {new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
-      </Text>
-    </View>
-  );
+    );
+  };
 
   return (
     <ScreenContainer edges={["top", "left", "right", "bottom"]} className="flex-1">
+      {/* KAV 上方的固定内容：量出高度给 iOS 的 keyboardVerticalOffset 用 */}
+      <View onLayout={(e) => setTopOffset(e.nativeEvent.layout.height)}>
       {/* 头部 */}
       <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
         <TouchableOpacity onPress={() => router.back()} className="p-1">
@@ -464,7 +729,8 @@ export default function AIScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* 结果条：所有操作反馈都在这里可见，Web 的 Alert.alert 是空函数 */}
+      {/* 结果条：所有操作反馈都在这里可见，Web 的 Alert.alert 是空函数。
+          键盘弹起时也必须保留，否则「已复制 / 已粘贴」这类反馈会看不见。 */}
       {notice && (
         <View
           className="mx-5 mt-3 rounded-xl px-4 py-3"
@@ -595,7 +861,7 @@ export default function AIScreen() {
             <>
           {/* Model */}
           <View className="mb-4">
-            <Text className="text-muted text-sm mb-2">模型</Text>
+            <Text className="text-muted text-sm mb-2">模型（对话 / 工具调用）</Text>
             <TextInput
               value={model}
               onChangeText={setModel}
@@ -611,17 +877,42 @@ export default function AIScreen() {
             {modelList.length > 0 && (
               <View className="flex-row flex-wrap gap-2 mt-2">
                 {modelList.map((id) => (
-                  <TouchableOpacity
-                    key={id}
-                    onPress={() => setModel(id)}
-                    className={`px-3 py-1 rounded-lg ${model === id ? "bg-primary" : "bg-background border border-border"}`}
-                    activeOpacity={0.7}
-                  >
-                    <Text className={model === id ? "text-background text-xs" : "text-foreground text-xs"}>{id}</Text>
-                  </TouchableOpacity>
+                  <View key={id} className="flex-row items-center rounded-lg bg-background border border-border overflow-hidden">
+                    <TouchableOpacity
+                      onPress={() => setModel(id)}
+                      className={`px-3 py-1 ${model === id ? "bg-primary" : ""}`}
+                      activeOpacity={0.7}
+                    >
+                      <Text className={model === id ? "text-background text-xs" : "text-foreground text-xs"}>{id}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => setVisionModel(id)}
+                      className="px-2 py-1 border-l border-border"
+                      activeOpacity={0.7}
+                    >
+                      <Text className={visionModel === id ? "text-primary text-xs" : "text-muted text-xs"}>设为视觉</Text>
+                    </TouchableOpacity>
+                  </View>
                 ))}
               </View>
             )}
+          </View>
+
+          {/* 视觉模型：图片识别专用，纯文本模型通常不支持图片 */}
+          <View className="mb-4">
+            <Text className="text-muted text-sm mb-2">视觉模型（图片识别，留空则用上面的模型）</Text>
+            <TextInput
+              value={visionModel}
+              onChangeText={setVisionModel}
+              placeholder={TOKENHUB_VISION_MODEL_EXAMPLE}
+              placeholderTextColor={colors.muted}
+              className="bg-background rounded-xl px-4 py-3 text-foreground border border-border"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text className="text-muted text-xs mt-2 leading-5">
+              发图片时先用这个模型识别，再把识别结果交给主模型回答。若报「不支持图片」，点「查模型名」找带 vl / vision 的 ID 填这里。
+            </Text>
           </View>
 
             </>
@@ -652,24 +943,32 @@ export default function AIScreen() {
         </View>
       )}
 
-      {/* 对话区域 */}
-      <KeyboardAvoidingView 
+      </View>
+
+      {/* 对话区域：KAV 只包「消息列表 + 输入区」，键盘弹出时压缩列表、顶起输入框 */}
+      <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : "height"}
         className="flex-1"
-        keyboardVerticalOffset={0}
+        keyboardVerticalOffset={Platform.OS === "ios" ? topOffset : 0}
+        style={Platform.OS === "web" && keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined}
       >
         {/* 消息列表 */}
         <FlatList
           ref={flatListRef}
           data={state.aiMessages}
-          keyExtractor={(item) => item.id}
+          keyExtractor={(item, index) => item.id || `msg_${item.timestamp}_${index}`}
           renderItem={renderMessage}
           contentContainerStyle={{ padding: 20, paddingBottom: 10 }}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode={Platform.OS === "ios" ? "on-drag" : undefined}
+          onContentSizeChange={() => {
+            if (isLoading || keyboardVisible) flatListRef.current?.scrollToEnd({ animated: true });
+          }}
           ListEmptyComponent={
             <View className="items-center py-10">
               <IconSymbol name="brain" size={48} color={colors.muted} />
               <Text className="text-muted mt-4 text-center">
-                {state.aiConfig.isConfigured 
+                {state.aiConfig.isConfigured
                   ? "开始和AI助手对话吧\n我可以帮你分析训练数据、提供建议"
                   : "请先配置API Key\n点击右上角齿轮图标"
                 }
@@ -704,13 +1003,44 @@ export default function AIScreen() {
           </View>
         )}
 
+        {/* 待发送图片预览 */}
+        {pendingImage && (
+          <View className="px-5 pt-3">
+            <View className="flex-row items-center rounded-xl border border-border bg-surface p-2">
+              <Image
+                source={{ uri: pendingImage.uri }}
+                style={{ width: 56, height: 56, borderRadius: 8 }}
+                resizeMode="cover"
+              />
+              <View className="flex-1 ml-3">
+                <Text className="text-foreground text-xs" numberOfLines={1}>
+                  {pendingImage.name || "已选择图片"}
+                </Text>
+                <Text className="text-muted text-xs mt-1">发送后由 AI 识别，结果会存进对话记录</Text>
+              </View>
+              <TouchableOpacity onPress={() => setPendingImage(null)} className="p-2" activeOpacity={0.7}>
+                <IconSymbol name="xmark" size={18} color={colors.muted} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
         {/* 输入区域 */}
         <View className="px-5 py-3 border-t border-border bg-background">
-          <View className="flex-row items-end gap-3">
+          <View className="flex-row items-end gap-2">
+            <TouchableOpacity
+              onPress={handlePickImage}
+              disabled={isLoading}
+              className="w-10 h-11 rounded-xl items-center justify-center bg-surface border border-border"
+              activeOpacity={0.7}
+            >
+              <IconSymbol name="photo" size={20} color={colors.muted} />
+            </TouchableOpacity>
             <TextInput
               value={inputText}
               onChangeText={setInputText}
-              placeholder="输入消息..."
+              onFocus={() => setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 120)}
+              placeholder={pendingImage ? "补充一句（可留空）..." : "输入消息..."}
               placeholderTextColor={colors.muted}
               multiline
               maxLength={1000}
@@ -718,17 +1048,24 @@ export default function AIScreen() {
               style={{ minHeight: 44 }}
             />
             <TouchableOpacity
+              onPress={handlePaste}
+              className="w-10 h-11 rounded-xl items-center justify-center bg-surface border border-border"
+              activeOpacity={0.7}
+            >
+              <IconSymbol name="doc.on.clipboard" size={19} color={colors.muted} />
+            </TouchableOpacity>
+            <TouchableOpacity
               onPress={handleSendMessage}
-              disabled={!inputText.trim() || isLoading}
+              disabled={(!inputText.trim() && !pendingImage) || isLoading}
               className={`w-11 h-11 rounded-full items-center justify-center ${
-                inputText.trim() && !isLoading ? "bg-primary" : "bg-muted/30"
+                (inputText.trim() || pendingImage) && !isLoading ? "bg-primary" : "bg-muted/30"
               }`}
               activeOpacity={0.8}
             >
-              <IconSymbol 
-                name="paperplane.fill" 
-                size={20} 
-                color={inputText.trim() && !isLoading ? colors.background : colors.muted} 
+              <IconSymbol
+                name="paperplane.fill"
+                size={20}
+                color={(inputText.trim() || pendingImage) && !isLoading ? colors.background : colors.muted}
               />
             </TouchableOpacity>
           </View>
