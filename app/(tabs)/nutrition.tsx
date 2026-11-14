@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import { Text, View, TouchableOpacity, TextInput, FlatList, Alert, ScrollView, Modal } from "react-native";
+import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
@@ -7,6 +8,7 @@ import { useApp } from "@/lib/app-context";
 import { calculateNutritionRecommendation, getRecommendedFoods, getAllFoods } from "@/lib/nutrition-engine";
 import { getCarbCycleDay } from "@/lib/carb-cycle";
 import { getTodayString } from "@/lib/storage";
+import { buildCustomNutritionPlan, formatPlanSummary, macroPercentages } from "@/lib/nutrition-plan";
 import type { NutritionLogItem, FoodLibraryItem, NutritionGoal, FoodCategory, CarbCycleDay, CarbCyclePlan } from "@/lib/types";
 import { NUTRITION_GOAL_NAMES, CARB_DAY_NAMES } from "@/lib/types";
 
@@ -14,6 +16,7 @@ const FOOD_CATEGORIES: FoodCategory[] = ["protein", "carbs", "fats", "vegetables
 
 export default function NutritionScreen() {
   const colors = useColors();
+  const router = useRouter();
   const {
     state,
     addNutritionEntry,
@@ -52,6 +55,15 @@ export default function NutritionScreen() {
   const [editingFood, setEditingFood] = useState<FoodLibraryItem | null>(null);
 
   const [currentGoal, setCurrentGoal] = useState<NutritionGoal>(state.userProfile.nutritionGoal);
+  // 「自定义」是第四个目标：AI 给出的营养参数存进 userProfile.customNutritionPlan，
+  // 选中后优先于公式推荐，成为每日目标。
+  const customPlan = state.userProfile.customNutritionPlan;
+  const [useCustomPlan, setUseCustomPlan] = useState<boolean>(!!customPlan?.enabled);
+  const [planCalories, setPlanCalories] = useState("");
+  const [planProtein, setPlanProtein] = useState("");
+  const [planCarbs, setPlanCarbs] = useState("");
+  const [planFats, setPlanFats] = useState("");
+  const [planNotice, setPlanNotice] = useState("");
   const [currentWeight, setCurrentWeight] = useState("");
   const [recommendation, setRecommendation] = useState<ReturnType<typeof calculateNutritionRecommendation> | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<FoodCategory | "all">("all");
@@ -98,6 +110,17 @@ export default function NutritionScreen() {
     }
   }, [currentGoal, state.userProfile.nutritionGoal, updateUserProfile]);
 
+  // AI 在别的页面写入/更新了自定义方案后，这里自动切过去并同步输入框。
+  useEffect(() => {
+    if (customPlan?.enabled) setUseCustomPlan(true);
+    if (customPlan) {
+      setPlanCalories(String(customPlan.calories));
+      setPlanProtein(String(customPlan.protein));
+      setPlanCarbs(String(customPlan.carbs));
+      setPlanFats(String(customPlan.fats));
+    }
+  }, [customPlan?.enabled, customPlan?.updatedAt]);
+
   const foodLibrary = useMemo(() => {
     const preset = getAllFoods().map((food) => ({ ...food, source: "database" as const })) as (FoodLibraryItem & { source: "database" })[];
     const custom = state.customFoods.map((food) => ({ ...food, source: "custom" as const })) as (FoodLibraryItem & { source: "custom" })[];
@@ -132,6 +155,53 @@ export default function NutritionScreen() {
     setCarbs((selectedFood.carbsPer100g * multiplier).toFixed(1));
     setFats((selectedFood.fatsPer100g * multiplier).toFixed(1));
   }, [selectedFood, quantity]);
+
+  const handleSelectGoal = async (goal: NutritionGoal | "custom") => {
+    setPlanNotice("");
+    if (goal === "custom") {
+      setUseCustomPlan(true);
+      if (customPlan && !customPlan.enabled) {
+        await updateUserProfile({ customNutritionPlan: { ...customPlan, enabled: true } });
+      }
+      return;
+    }
+    setCurrentGoal(goal);
+    setUseCustomPlan(false);
+    if (customPlan?.enabled) {
+      await updateUserProfile({ customNutritionPlan: { ...customPlan, enabled: false } });
+    }
+  };
+
+  const handleSaveCustomPlan = async () => {
+    const c = Number(planCalories);
+    if (!Number.isFinite(c) || c <= 0) {
+      setPlanNotice("请输入有效的每日热量（kcal）");
+      return;
+    }
+    const plan = buildCustomNutritionPlan(
+      {
+        calories: c,
+        protein: Number(planProtein) || 0,
+        carbs: Number(planCarbs) || 0,
+        fats: Number(planFats) || 0,
+      },
+      "manual",
+      customPlan?.note
+    );
+    await updateUserProfile({ customNutritionPlan: plan });
+    setUseCustomPlan(true);
+    setPlanNotice(`已保存并生效：${formatPlanSummary(plan)}`);
+  };
+
+  const handleClearCustomPlan = async () => {
+    await updateUserProfile({ customNutritionPlan: undefined });
+    setUseCustomPlan(false);
+    setPlanCalories("");
+    setPlanProtein("");
+    setPlanCarbs("");
+    setPlanFats("");
+    setPlanNotice("已清除自定义方案，恢复按预设公式计算");
+  };
 
   const handleCalculateRecommendation = () => {
     const weight = parseFloat(currentWeight);
@@ -276,7 +346,18 @@ export default function NutritionScreen() {
 
   const carbToday = activeCarbPlan ? getCarbCycleDay(activeCarbPlan, date) : null;
 
+  const customActive = !!customPlan?.enabled && useCustomPlan && customPlan.calories > 0;
+
   const dailyTarget = useMemo(() => {
+    // 自定义方案优先：AI 给的参数应直接决定每日目标，而不是只显示成一段文字。
+    if (customActive && customPlan) {
+      return {
+        calories: customPlan.calories,
+        carbs: customPlan.carbs,
+        protein: customPlan.protein,
+        fats: customPlan.fats,
+      };
+    }
     if (carbToday?.day) {
       return {
         calories: carbToday.day.calories,
@@ -294,7 +375,7 @@ export default function NutritionScreen() {
       };
     }
     return null;
-  }, [carbToday, recommendation]);
+  }, [carbToday, recommendation, customActive, customPlan]);
 
   const recommendedFoods = useMemo(() => {
     if (!recommendation) return [];
@@ -406,7 +487,9 @@ export default function NutritionScreen() {
             <View className="flex-row items-center justify-between mb-2">
               <Text className="text-foreground font-semibold">今日统计</Text>
               {dailyTarget && (
-                <Text className="text-muted text-xs">目标 {dailyTarget.calories} kcal</Text>
+                <Text className="text-muted text-xs">
+                  {customActive ? "自定义" : "目标"} {dailyTarget.calories} kcal
+                </Text>
               )}
             </View>
             <View className="flex-row justify-between">
@@ -652,24 +735,137 @@ export default function NutritionScreen() {
       {activeTab === "recommend" && (
         <ScrollView className="flex-1" contentContainerStyle={{ paddingBottom: 100 }}>
           <View className="px-5 py-4">
-            {/* 目标选择 */}
+            {/* 目标选择：三个预设 + 自定义（AI 营养建议落点） */}
             <Text className="text-foreground font-semibold mb-3">训练目标</Text>
             <View className="flex-row gap-2 mb-4">
-              {(Object.keys(NUTRITION_GOAL_NAMES) as NutritionGoal[]).map((goal) => (
+              {[
+                ...(Object.keys(NUTRITION_GOAL_NAMES) as NutritionGoal[]).map((goal) => ({
+                  key: goal as string,
+                  label: NUTRITION_GOAL_NAMES[goal],
+                  value: goal as NutritionGoal | "custom",
+                })),
+                { key: "custom", label: "自定义", value: "custom" as const },
+              ].map((option) => {
+                const selected = useCustomPlan
+                  ? option.value === "custom"
+                  : currentGoal === option.value;
+                return (
+                  <TouchableOpacity
+                    key={option.key}
+                    onPress={() => handleSelectGoal(option.value)}
+                    className={`flex-1 py-3 rounded-lg items-center ${
+                      selected ? "bg-primary" : "bg-surface border border-border"
+                    }`}
+                    activeOpacity={0.7}
+                  >
+                    <Text className={`text-xs ${selected ? "text-background font-semibold" : "text-foreground"}`}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            {/* 自定义营养方案：AI 建议写入这里，可手改、清除、跳去 AI 重新生成 */}
+            {useCustomPlan && (
+              <View className="bg-primary/10 rounded-xl p-4 mb-4 border border-border">
+                <View className="flex-row items-center justify-between mb-2">
+                  <Text className="text-foreground font-semibold">自定义营养方案</Text>
+                  <Text className="text-primary text-xs">
+                    {customPlan?.source === "ai" ? "AI 建议" : "手动"}
+                    {customPlan?.enabled ? " · 已生效" : ""}
+                  </Text>
+                </View>
+                <Text className="text-muted text-xs mb-3 leading-5">
+                  AI 给出的营养参数会存到这里，并直接作为「今日统计」的每日目标；数值可随时改。
+                </Text>
+                {customPlan?.note ? (
+                  <Text className="text-muted text-xs mb-2" numberOfLines={2}>{customPlan.note}</Text>
+                ) : null}
+                {customPlan ? (
+                  <Text className="text-muted text-xs mb-3">
+                    更新于 {new Date(customPlan.updatedAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                  </Text>
+                ) : null}
+
+                <View className="flex-row gap-2 mb-2">
+                  <TextInput
+                    value={planCalories}
+                    onChangeText={setPlanCalories}
+                    placeholder="热量 kcal"
+                    keyboardType="decimal-pad"
+                    placeholderTextColor={colors.muted}
+                    className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
+                  />
+                  <TextInput
+                    value={planProtein}
+                    onChangeText={setPlanProtein}
+                    placeholder="蛋白 g"
+                    keyboardType="decimal-pad"
+                    placeholderTextColor={colors.muted}
+                    className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
+                  />
+                </View>
+                <View className="flex-row gap-2 mb-3">
+                  <TextInput
+                    value={planCarbs}
+                    onChangeText={setPlanCarbs}
+                    placeholder="碳水 g"
+                    keyboardType="decimal-pad"
+                    placeholderTextColor={colors.muted}
+                    className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
+                  />
+                  <TextInput
+                    value={planFats}
+                    onChangeText={setPlanFats}
+                    placeholder="脂肪 g"
+                    keyboardType="decimal-pad"
+                    placeholderTextColor={colors.muted}
+                    className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
+                  />
+                </View>
+
+                {customActive && customPlan ? (
+                  <View className="mb-3">
+                    <Text className="text-foreground text-sm font-medium mb-1">
+                      当前目标：{formatPlanSummary(customPlan)}
+                    </Text>
+                    <Text className="text-muted text-xs">
+                      供能占比 蛋白 {macroPercentages(customPlan).protein}% · 碳水 {macroPercentages(customPlan).carbs}% · 脂肪 {macroPercentages(customPlan).fats}%
+                    </Text>
+                  </View>
+                ) : null}
+
+                <View className="flex-row gap-2">
+                  <TouchableOpacity
+                    onPress={handleSaveCustomPlan}
+                    className="flex-1 bg-primary rounded-lg py-2 items-center"
+                    activeOpacity={0.8}
+                  >
+                    <Text className="text-background font-semibold text-sm">保存并生效</Text>
+                  </TouchableOpacity>
+                  {customPlan && (
+                    <TouchableOpacity
+                      onPress={handleClearCustomPlan}
+                      className="bg-error/10 rounded-lg px-3 items-center justify-center"
+                      activeOpacity={0.8}
+                    >
+                      <Text className="text-error text-sm">清除</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+                {planNotice ? (
+                  <Text className="text-primary text-xs mt-2 leading-5">{planNotice}</Text>
+                ) : null}
                 <TouchableOpacity
-                  key={goal}
-                  onPress={() => setCurrentGoal(goal)}
-                  className={`flex-1 py-3 rounded-lg items-center ${
-                    currentGoal === goal ? "bg-primary" : "bg-surface border border-border"
-                  }`}
+                  onPress={() => router.push("/profile/ai")}
+                  className="mt-3 self-start"
                   activeOpacity={0.7}
                 >
-                  <Text className={currentGoal === goal ? "text-background font-semibold" : "text-foreground"}>
-                    {NUTRITION_GOAL_NAMES[goal]}
-                  </Text>
+                  <Text className="text-primary text-xs">去 AI 助手生成一套营养参数建议 →</Text>
                 </TouchableOpacity>
-              ))}
-            </View>
+              </View>
+            )}
 
             {/* 体重输入 */}
             <Text className="text-foreground font-semibold mb-2">当前体重 (kg)</Text>
@@ -691,8 +887,8 @@ export default function NutritionScreen() {
               </TouchableOpacity>
             </View>
 
-            {/* 推荐结果 */}
-            {recommendation && (
+            {/* 推荐结果（自定义模式下不生效，隐藏以免误读） */}
+            {recommendation && !useCustomPlan && (
               <View className="bg-primary/10 rounded-xl p-4 mb-4">
                 <Text className="text-foreground font-semibold mb-4">营养推荐</Text>
                 <View className="gap-3">

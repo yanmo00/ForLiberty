@@ -180,6 +180,19 @@ export interface BodyMetricEntry {
   source?: 'manual' | 'mi-scale' | 'import';
 }
 
+// 自定义营养方案：AI 给出的饮食营养参数建议落在这里，
+// 在「饮食 → 营养建议 → 自定义」里查看/修改，并作为当前每日目标生效。
+export interface CustomNutritionPlan {
+  calories: number;
+  protein: number;
+  carbs: number;
+  fats: number;
+  note?: string;
+  source: "ai" | "manual";
+  updatedAt: string;
+  enabled: boolean;
+}
+
 // 用户资料
 export interface UserProfile {
   height?: number;
@@ -195,6 +208,7 @@ export interface UserProfile {
   activeCarbCyclePlanId?: string;
   favoriteFoodIds: string[];
   sleepHours?: number;
+  customNutritionPlan?: CustomNutritionPlan;
 }
 
 // 动作能力记录

@@ -25,6 +25,11 @@ import { buildAISnapshot } from "@/lib/ai/data-model";
 import { buildSystemPrompt } from "@/lib/ai/system-prompt";
 import { AI_TOOLS, executeToolCall, type ToolResult } from "@/lib/ai/tools";
 import {
+  buildCustomNutritionPlan,
+  parseNutritionPlanFromText,
+  formatPlanSummary,
+} from "@/lib/nutrition-plan";
+import {
   TOKENHUB_BASE_URL,
   TOKENHUB_CONSOLE_URL,
   TOKENHUB_DEFAULT_MODEL,
@@ -158,7 +163,7 @@ export default function AIScreen() {
   const colors = useColors();
   const router = useRouter();
   const app = useApp();
-  const { state, updateAIConfig, addAIMessage, updateAIMessage, clearAIMessages } = app;
+  const { state, updateAIConfig, addAIMessage, updateAIMessage, clearAIMessages, updateUserProfile } = app;
   const flatListRef = useRef<FlatList>(null);
   // 图片本体只存内存：持久化消息里只放识别文字，避免大 base64 撑爆 AsyncStorage。
   const imagePreviews = useRef<Record<string, string>>({});
@@ -283,6 +288,39 @@ export default function AIScreen() {
       notify("成功 · 已复制", `已复制 ${text.length} 个字符到剪贴板`);
     } catch {
       notify("错误 · 复制失败", "当前环境不允许写入剪贴板，可长按文本复制。");
+    }
+  };
+
+  // 把任意一条 AI 回复里的营养参数存进「饮食 → 营养建议 → 自定义」。
+  // 模型不支持工具调用、或只是纯文字给建议时，这个按钮保证建议仍能被收进自定义。
+  const handleSaveNutritionFromText = async (text: string) => {
+    const parsed = parseNutritionPlanFromText(text);
+    if (!parsed) {
+      notify(
+        "提示 · 没识别到营养参数",
+        "这条回复里没找到完整的「热量 + 至少两项宏量」。可以让 AI 用列表写清四个数字，或到「饮食 → 营养建议 → 自定义」手动填写。"
+      );
+      return;
+    }
+    const missing = (["protein", "carbs", "fats"] as const).filter((k) => parsed[k] === undefined);
+    try {
+      const plan = buildCustomNutritionPlan(
+        {
+          calories: parsed.calories ?? 0,
+          protein: parsed.protein ?? 0,
+          carbs: parsed.carbs ?? 0,
+          fats: parsed.fats ?? 0,
+        },
+        "ai",
+        "从 AI 对话回复中提取"
+      );
+      await updateUserProfile({ customNutritionPlan: plan });
+      const suffix = missing.length
+        ? `\n其中 ${missing.map((k) => ({ protein: "蛋白", carbs: "碳水", fats: "脂肪" })[k]).join("、")} 未识别，已填 0，请到自定义页补齐。`
+        : "";
+      notify("成功 · 已存入自定义", `${formatPlanSummary(plan)}\n已设为当前每日目标，可在「饮食 → 营养建议 → 自定义」查看/修改。${suffix}`);
+    } catch (e) {
+      notify("错误 · 保存失败", e instanceof Error ? e.message : "未知错误");
     }
   };
 
@@ -521,9 +559,14 @@ export default function AIScreen() {
     setIsLoading(true);
     setToolActions([]);
 
+    const activeCustomPlan = state.userProfile.customNutritionPlan;
     const systemPrompt =
       generateSystemPrompt() +
-      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、添加食物、创建碳循环计划、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么；参数不确定的字段可省略。" +
+      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、添加食物、创建碳循环计划、保存自定义营养方案、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么；参数不确定的字段可省略。" +
+      "\n\n[营养方案] 当用户询问饮食/营养参数建议（每日热量、蛋白、碳水、脂肪），或你主动给出一套具体数值方案时，务必调用 save_custom_nutrition_plan 把四个数值保存到「饮食 → 营养建议 → 自定义」并设为当前每日目标，回复里说明已保存；用户要求取消时可调用 clear_custom_nutrition_plan。回复里请用列表把四个数字写清楚，方便用户核对。" +
+      (activeCustomPlan?.enabled
+        ? `\n\n[当前自定义营养目标] ${formatPlanSummary(activeCustomPlan)}（已生效，给饮食建议时以此为准）`
+        : "") +
       (image
         ? "\n\n[图片] 本轮消息里已附上「图片识别结果」。把它当作事实上下文来回答；其中若有食物热量、体测数值或训练组次，请调用对应工具保存，并在回复里说明存了什么。"
         : "");
@@ -738,10 +781,20 @@ export default function AIScreen() {
             {new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
           </Text>
           {item.role === "assistant" && (
-            <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
-              <IconSymbol name="square.on.square" size={13} color={colors.muted} />
-              <Text className="text-muted text-xs ml-1">复制</Text>
-            </TouchableOpacity>
+            <>
+              <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
+                <IconSymbol name="square.on.square" size={13} color={colors.muted} />
+                <Text className="text-muted text-xs ml-1">复制</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => handleSaveNutritionFromText(item.content)}
+                className="ml-3 flex-row items-center"
+                activeOpacity={0.7}
+              >
+                <IconSymbol name="pencil" size={13} color={colors.muted} />
+                <Text className="text-muted text-xs ml-1">存入自定义</Text>
+              </TouchableOpacity>
+            </>
           )}
         </View>
       </View>

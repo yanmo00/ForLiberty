@@ -8,6 +8,7 @@ import type {
   CarbDayType,
 } from "../types";
 import { generateId, getTodayString } from "../storage";
+import { buildCustomNutritionPlan, formatPlanSummary } from "../nutrition-plan";
 
 export interface ToolResult {
   ok: boolean;
@@ -354,6 +355,33 @@ export const AI_TOOLS: Record<string, unknown>[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "save_custom_nutrition_plan",
+      description:
+        "把 AI 给出的饮食营养参数建议（每日热量/蛋白质/碳水/脂肪）保存到「饮食 → 营养建议 → 自定义」并设为当前生效的每日目标。当用户询问饮食营养建议、热量或宏量分配，或你主动给出一套具体数值方案时调用。",
+      parameters: {
+        type: "object",
+        properties: {
+          calories: { type: "number", description: "每日热量 kcal" },
+          protein: { type: "number", description: "每日蛋白质 g" },
+          carbs: { type: "number", description: "每日碳水 g" },
+          fats: { type: "number", description: "每日脂肪 g" },
+          note: { type: "string", description: "一句话说明方案依据，可省略" },
+        },
+        required: ["calories", "protein", "carbs", "fats"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "clear_custom_nutrition_plan",
+      description: "清除「营养建议 → 自定义」里的自定义营养方案，恢复按预设目标公式计算每日目标。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
 ];
 
 // ── 动作分发 ──────────────────────────────────────────────────────────
@@ -594,6 +622,29 @@ export async function executeToolCall(
         if (!m) return { ok: false, summary: "未找到体测记录" };
         await app.deleteBodyMetric(m.id);
         return { ok: true, summary: `已删除体测记录（${m.date}）` };
+      }
+
+      case "save_custom_nutrition_plan": {
+        const plan = buildCustomNutritionPlan(
+          {
+            calories: Number(args.calories) || 0,
+            protein: Number(args.protein) || 0,
+            carbs: Number(args.carbs) || 0,
+            fats: Number(args.fats) || 0,
+          },
+          "ai",
+          typeof args.note === "string" ? args.note.slice(0, 200) : undefined
+        );
+        await app.updateUserProfile({ customNutritionPlan: plan });
+        return {
+          ok: true,
+          summary: `已把营养建议存入「自定义」并设为每日目标：${formatPlanSummary(plan)}`,
+        };
+      }
+
+      case "clear_custom_nutrition_plan": {
+        await app.updateUserProfile({ customNutritionPlan: undefined });
+        return { ok: true, summary: "已清除自定义营养方案，恢复预设公式" };
       }
 
       default:
