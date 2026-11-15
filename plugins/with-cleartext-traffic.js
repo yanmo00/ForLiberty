@@ -15,6 +15,14 @@ module.exports = function withCleartextTraffic(config) {
     if (application) {
       if (!application.$) application.$ = { "android:name": ".MainApplication" };
       application.$["android:usesCleartextTraffic"] = "true";
+
+      // SDK 54 的 edgeToEdgeEnabled 下，若不是 adjustResize，窗口不会随键盘缩短，
+      // KeyboardAvoidingView 拿不到正确的可视高度，输入框会被键盘盖住。
+      const activities = Array.isArray(application.activity) ? application.activity : [];
+      for (const activity of activities) {
+        if (!activity.$) activity.$ = {};
+        activity.$["android:windowSoftInputMode"] = "adjustResize";
+      }
     }
     return mod;
   });

@@ -7,7 +7,6 @@ import {
   FlatList,
   Alert,
   ActivityIndicator,
-  KeyboardAvoidingView,
   Platform,
   Image,
   Modal,
@@ -291,10 +290,12 @@ export default function AIScreen() {
   // 配置面板是页面里唯一需要自己滚动的区域：头部/状态栏/结果条/底部按钮都常驻，
   // 只给表单区一个上限高度，避免内容把聊天区挤没、也避免超出屏幕被裁掉无法下滑。
   const { height: windowHeight } = useWindowDimensions();
-  const configMaxHeight = Math.max(
-    180,
-    Math.round((Math.max(360, windowHeight - keyboardHeight)) * (notice ? 0.46 : 0.54))
-  );
+  const configMaxHeight = keyboardVisible
+    ? Math.max(100, Math.round((Math.max(360, windowHeight - keyboardHeight)) * 0.26))
+    : Math.max(
+        180,
+        Math.round(windowHeight * (notice ? 0.46 : 0.54))
+      );
   // Web 预览时本机代理是否在线：一眼能看出「请求失败」是不是代理没起导致的
   const [proxyAlive, setProxyAlive] = useState<boolean | null>(null);
 
@@ -933,9 +934,14 @@ export default function AIScreen() {
     );
   };
 
-  // AI 界面自带只包「消息列表 + 输入区」的 KAV，关掉容器层规避以免叠加
+  // 键盘避让统一交给 ScreenContainer：原生用 KAV 压缩整页，Web 用 paddingBottom。
+  // 以前 AI 页自己再套一层 KAV，两层叠加会让输入区算错高度、仍被键盘盖住。
   return (
-    <ScreenContainer edges={["top", "left", "right", "bottom"]} className="flex-1" keyboardAware={false}>
+    <ScreenContainer
+      edges={["top", "left", "right", "bottom"]}
+      className="flex-1"
+      keyboardVerticalOffset={Platform.OS === "ios" ? topOffset : 0}
+    >
       {/* KAV 上方的固定内容：量出高度给 iOS 的 keyboardVerticalOffset 用。
           flexShrink=0 保证聊天区只拿「剩余高度」，不会把配置区压扁或顶出屏幕。 */}
       <View
@@ -1039,7 +1045,7 @@ export default function AIScreen() {
           {/* 诊断文本可能很长（EasyTier 排查 4 条），单独限高并允许滚动，
               否则结果条会把下面的配置面板和保存按钮一起挤出屏幕 */}
           <ScrollView
-            style={{ maxHeight: 130, flexGrow: 0, flexShrink: 0, marginTop: 8 }}
+            style={{ maxHeight: keyboardVisible ? 60 : 130, flexGrow: 0, flexShrink: 0, marginTop: 8 }}
             nestedScrollEnabled
             showsVerticalScrollIndicator
           >
@@ -1281,13 +1287,8 @@ export default function AIScreen() {
 
       </View>
 
-      {/* 对话区域：KAV 只包「消息列表 + 输入区」，键盘弹出时压缩列表、顶起输入框 */}
-      <KeyboardAvoidingView
-        behavior={Platform.OS === "ios" ? "padding" : "height"}
-        className="flex-1"
-        keyboardVerticalOffset={Platform.OS === "ios" ? topOffset : 0}
-        style={Platform.OS === "web" && keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined}
-      >
+      {/* 对话区域只拿剩余高度；外层容器被键盘压缩后，底部输入区自然贴在键盘上沿 */}
+      <View className="flex-1">
         {/* 消息列表 */}
         <FlatList
           ref={flatListRef}
@@ -1406,7 +1407,7 @@ export default function AIScreen() {
             </TouchableOpacity>
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </View>
 
       {/* 长按气泡后的文字选择浮层：纯文本可长按拖选，复制后可直接粘回输入框 */}
       <Modal
