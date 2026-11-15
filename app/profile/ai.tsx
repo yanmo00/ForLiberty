@@ -197,8 +197,24 @@ async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<stri
 
 // 待发送的图片：uri 是 data URI（base64），只放内存，不写进持久化消息。
 type PendingImage = { uri: string; name?: string; mimeType: string };
-// 单张图片上限，超过就提示换小图，避免请求体过大被网关/代理拒掉。
+// 一次最多选 6 张：多图一起发给视觉模型，请求体太大会被网关/代理拒掉。
+const MAX_IMAGES = 6;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
+// 代理请求体上限 20MB，base64 会再膨胀约 1/3 → 多图总量留足余量。
+const MAX_TOTAL_IMAGE_BYTES = 10 * 1024 * 1024;
+// 聊天气泡里的多图网格：等大缩略图，自动换行，不配说明文字。
+const IMAGE_TILE_STYLE = {
+  width: 84,
+  height: 84,
+  borderRadius: 10,
+  marginRight: 6,
+  marginBottom: 6,
+} as const;
+const IMAGE_PLACEHOLDER_STYLE = {
+  alignItems: "center" as const,
+  justifyContent: "center" as const,
+  backgroundColor: "rgba(127,127,127,0.18)",
+};
 
 // RN Web 的 Text 默认不可选，显式打开 user-select 才能长按/拖选。
 const WEB_SELECTABLE = Platform.OS === "web" ? ({ userSelect: "text", cursor: "text" } as any) : undefined;
@@ -264,8 +280,8 @@ export default function AIScreen() {
   const app = useApp();
   const { state, updateAIConfig, addAIMessage, updateAIMessage, setAIMessages, updateUserProfile } = app;
   const flatListRef = useRef<FlatList>(null);
-  // 图片本体只存内存：持久化消息里只放识别文字，避免大 base64 撑爆 AsyncStorage。
-  const imagePreviews = useRef<Record<string, string>>({});
+  // 图片本体只存内存：按消息 id 存一组 data URI，避免大 base64 撑爆 AsyncStorage。
+  const imagePreviews = useRef<Record<string, string[]>>({});
   // 最新消息镜像：构建模型上下文时不再依赖渲染闭包里的旧 state。
   const messagesRef = useRef<AIMessage[]>(state.aiMessages);
 
@@ -292,7 +308,7 @@ export default function AIScreen() {
   // 对话状态
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
+  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   // 长按气泡进入「选择文字」浮层：里面是纯文本，保证任何平台都能长按拖选片段。
   const [selectionTarget, setSelectionTarget] = useState<AIMessage | null>(null);
   // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
@@ -352,8 +368,13 @@ export default function AIScreen() {
     return () => clearTimeout(timer);
   }, [keyboardVisible]);
 
-  // 选图：只做本地读取，不发请求；发送时才识别
+  // 选图：一次可多选（也可分几次追加），只做本地读取，发送时才一次性识别。
   const handlePickImage = async () => {
+    const room = MAX_IMAGES - pendingImages.length;
+    if (room <= 0) {
+      notify("提示 · 已达到上限", `一次最多发送 ${MAX_IMAGES} 张图片，先删掉几张再加。`);
+      return;
+    }
     try {
       if (Platform.OS !== "web") {
         const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -364,19 +385,31 @@ export default function AIScreen() {
       }
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: "images",
+        allowsMultipleSelection: true,
+        selectionLimit: room,
         allowsEditing: false,
         quality: 0.4,
         base64: true,
       });
       if (result.canceled || !result.assets?.length) return;
-      const picked = await toDataUri(result.assets[0]);
-      const base64Part = picked.uri.split(",")[1] || "";
-      if (base64Part.length * 0.75 > MAX_IMAGE_BYTES) {
-        notify("错误 · 图片过大", "这张图太大，换一张小图或截图再试（建议压缩后小于 4MB）。");
-        return;
+
+      const accepted: PendingImage[] = [];
+      let totalBytes = pendingImages.reduce((sum, img) => sum + (img.uri.split(",")[1] || "").length * 0.75, 0);
+      let oversized = 0;
+      for (const asset of result.assets.slice(0, room)) {
+        const picked = await toDataUri(asset);
+        const bytes = (picked.uri.split(",")[1] || "").length * 0.75;
+        if (bytes > MAX_IMAGE_BYTES || totalBytes + bytes > MAX_TOTAL_IMAGE_BYTES) {
+          oversized++;
+          continue;
+        }
+        totalBytes += bytes;
+        accepted.push({ uri: picked.uri, mimeType: picked.mimeType, name: picked.name });
       }
-      setPendingImage({ uri: picked.uri, mimeType: picked.mimeType, name: picked.name });
-      notify("提示 · 已选择图片", "可以补一句想问什么，直接点发送就开始识别。");
+      if (accepted.length) setPendingImages((prev) => [...prev, ...accepted]);
+      if (oversized > 0) {
+        notify("提示 · 部分图片未加入", `${oversized} 张图片太大或总量超限，已跳过；单张建议小于 4MB。`);
+      }
     } catch (error) {
       notify("错误 · 选图失败", error instanceof Error ? error.message : "未知错误");
     }
@@ -674,23 +707,26 @@ export default function AIScreen() {
   // 以前这里直接报错、把消息退回输入框让用户手动重发，表现就是「时灵时不灵」。
   // 现在自动重试 3 次：逐次把 image_url 提前（部分网关对 content 顺序敏感）、
   // 强化 system 提示、加大输出预算；只有 3 次都失败才把文字+图片退回。
-  const recognizeImage = async (dataUri: string, question: string): Promise<string> => {
+  const recognizeImages = async (dataUris: string[], question: string): Promise<string> => {
     // 与 callChat 保持一致：用配置面板当前值，刚填了视觉模型没点保存也能生效。
     const vision = (visionModel.trim() || state.aiConfig.visionModel || "").trim();
-    // 识别食物清单输出较长，Auto 又可能路由到推理型型号 → 预算至少 8192，逐次递增。
-    const baseTokens = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
+    // 多图清单输出更长，Auto 又可能路由到推理型型号 → 预算按张数递增。
+    const baseTokens = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192 + (dataUris.length - 1) * 2048);
     const systemBase =
       "你是图片识别助手。用中文客观描述图片内容，只写看得清的内容，不要编造数字。" +
+      (dataUris.length > 1
+        ? `本条消息共有 ${dataUris.length} 张图片，请用「图片1：」「图片2：」…分段逐张列出，不要混在一起。`
+        : "") +
       "若是食物/餐盘：逐项列出食物、估算份量(g)、热量(kcal)与蛋白/碳水/脂肪(g)。" +
       "若是体脂秤或体测报告：逐项抄录体重、体脂率、BMI、肌肉量等数值与单位。" +
       "若是训练计划表：列出动作、组数、次数、重量。最后给一行『可记录数据：…』摘要。";
     let lastReason = "视觉模型没有返回识别结果";
 
     for (let attempt = 0; attempt < 3; attempt++) {
-      const imagePart = { type: "image_url", image_url: { url: dataUri } };
+      const imageParts = dataUris.map((uri) => ({ type: "image_url", image_url: { url: uri } }));
       const textPart = {
         type: "text",
-        text: question || "请识别这张图片，并把其中可记录的数据逐项列出来。",
+        text: question || "请逐张识别这些图片，并把其中可记录的数据逐项列出来。",
       };
       const messages = [
         {
@@ -702,7 +738,7 @@ export default function AIScreen() {
               : ""),
         },
         // 第二次起图片放前面：有些网关只解析第一个 content part。
-        { role: "user", content: attempt > 0 ? [imagePart, textPart] : [textPart, imagePart] },
+        { role: "user", content: attempt > 0 ? [...imageParts, textPart] : [textPart, ...imageParts] },
       ];
 
       let data: any;
@@ -745,8 +781,8 @@ export default function AIScreen() {
   // 发送消息（支持图片识别 + 工具循环：模型可多次调用工具直到达成目标）
   const handleSendMessage = async () => {
     const text = inputText.trim();
-    const image = pendingImage;
-    if (!text && !image) return;
+    const images = pendingImages;
+    if (!text && images.length === 0) return;
     if (!state.aiConfig.isConfigured) {
       notify("提示", "请先配置 API Key");
       setShowConfig(true);
@@ -754,17 +790,20 @@ export default function AIScreen() {
     }
 
     // 先把用户消息落库再发请求：即使后续识别/回话失败，这条也不会消失。
-    const userContent = text || "请识别这张图片并给出要点";
+    // 只发图片时不往气泡里塞默认文字，界面上就只看到排列好的缩略图。
+    const userContent = text;
     const userMsg = addAIMessage({
       role: "user",
       content: userContent,
-      ...(image ? { image: { name: image.name, mimeType: image.mimeType } } : {}),
+      ...(images.length
+        ? { images: images.map((img) => ({ name: img.name, mimeType: img.mimeType })) }
+        : {}),
     });
-    if (image) imagePreviews.current[userMsg.id] = image.uri;
+    if (images.length) imagePreviews.current[userMsg.id] = images.map((img) => img.uri);
     messagesRef.current = [...messagesRef.current, userMsg];
 
     setInputText("");
-    setPendingImage(null);
+    setPendingImages([]);
     setIsLoading(true);
     setToolActions([]);
 
@@ -777,18 +816,18 @@ export default function AIScreen() {
       (activeCustomPlan?.enabled
         ? `\n\n[当前自定义营养目标] ${formatPlanSummary(activeCustomPlan)}（已生效，给饮食建议时以此为准）`
         : "") +
-      (image
-        ? "\n\n[图片] 本轮消息里已附上「图片识别结果」。把它当作事实上下文来回答；其中若有食物热量、体测数值或训练组次，请调用对应工具保存，并在回复里说明存了什么。"
+      (images.length
+        ? `\n\n[图片] 本轮消息里附了 ${images.length} 张图片的识别结果。把它当作事实上下文来回答；其中若有食物热量、体测数值或训练组次，请调用对应工具保存，并在回复里说明存了什么。`
         : "");
 
     let executedCount = 0;
     try {
       let contextText = userContent;
 
-      if (image) {
+      if (images.length) {
         let analysis: string;
         try {
-          analysis = await recognizeImage(image.uri, text);
+          analysis = await recognizeImages(images.map((img) => img.uri), text);
         } catch (err) {
           const raw = err instanceof Error ? err.message : String(err);
           const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404|图片/i.test(raw)
@@ -800,18 +839,18 @@ export default function AIScreen() {
           deleteOneMessage(userMsg.id);
           messagesRef.current = messagesRef.current.filter((m) => m.id !== userMsg.id);
           setInputText(text);
-          setPendingImage(image);
+          setPendingImages(images);
           return;
         }
-        // 识别结果写回这条消息 → 随聊天记录持久化/导出，就是「对应数据记录」
+        // 识别文字只作为模型上下文与本机数据记录，气泡里不再堆说明文字。
         updateAIMessage(userMsg.id, { imageAnalysis: analysis });
         messagesRef.current = messagesRef.current.map((m) =>
           m.id === userMsg.id ? { ...m, imageAnalysis: analysis } : m
         );
         contextText = [
-          text || "请分析这张图片",
+          text || "请分析这些图片",
           "",
-          "[图片识别结果（已保存到对话记录）]",
+          "[图片识别结果]",
           analysis,
           "",
           "请基于以上识别结果回答。若其中包含可记录的数据（食物热量、体测数值、训练组次等），请调用对应工具保存，并在回复里说明存了什么。",
@@ -824,7 +863,11 @@ export default function AIScreen() {
         ...messagesRef.current
           .slice(-12)
           .filter((m) => m.id !== userMsg.id)
-          .map((m) => ({ role: m.role, content: m.content })),
+          .map((m) => ({
+            role: m.role,
+            // 纯图片消息没有文字正文，用保存的识别结果接着当上下文，避免空串让模型困惑。
+            content: m.content || (m.imageAnalysis ? `[此前图片识别结果] ${m.imageAnalysis}` : ""),
+          })),
         { role: "user", content: contextText },
       ];
 
@@ -900,7 +943,7 @@ export default function AIScreen() {
         deleteOneMessage(userMsg.id);
         messagesRef.current = messagesRef.current.filter((m) => m.id !== userMsg.id);
         setInputText(text);
-        if (image) setPendingImage(image);
+        if (images.length) setPendingImages(images);
       }
     } finally {
       setIsLoading(false);
@@ -1012,7 +1055,13 @@ export default function AIScreen() {
   }), [colors]);
 
   const renderMessage = ({ item }: { item: AIMessage }) => {
-    const previewUri = imagePreviews.current[item.id];
+    const previewUris = imagePreviews.current[item.id] || [];
+    // 兼容旧的单图消息；新消息走 images 数组。
+    const imageCount = Math.max(
+      previewUris.length,
+      item.images?.length ?? 0,
+      item.image ? 1 : 0
+    );
     const isUser = item.role === "user";
     return (
       <View className={`mb-3 ${isUser ? "items-end" : "items-start"}`}>
@@ -1023,44 +1072,35 @@ export default function AIScreen() {
               isUser ? "bg-primary" : "bg-surface border border-border"
             }`}
           >
-            {item.image &&
-              (previewUri ? (
-                <Image
-                  source={{ uri: previewUri }}
-                  style={{ width: 200, height: 150, borderRadius: 10, marginBottom: 8 }}
-                  resizeMode="cover"
-                />
-              ) : (
-                <View className="flex-row items-center mb-2">
-                  <IconSymbol name="photo" size={16} color={isUser ? colors.background : colors.muted} />
-                  <Text className={`text-xs ml-2 ${isUser ? "text-background" : "text-muted"}`} numberOfLines={1}>
-                    {item.image.name || "图片（识别结果已保存）"}
-                  </Text>
-                </View>
-              ))}
-            {isUser ? (
-              <Text selectable style={WEB_SELECTABLE} className="text-background">
-                {item.content}
-              </Text>
-            ) : (
-              <Markdown style={markdownStyles} rules={SELECTABLE_MARKDOWN_RULES}>
-                {item.content}
-              </Markdown>
-            )}
-            {item.imageAnalysis ? (
-              <View className={`mt-2 pt-2 border-t ${isUser ? "border-background/30" : "border-border"}`}>
-                <Text className={`text-xs font-semibold mb-1 ${isUser ? "text-background" : "text-muted"}`}>
-                  📷 识别结果（已保存）
-                </Text>
-                <Text
-                  selectable
-                  style={WEB_SELECTABLE}
-                  className={`text-xs leading-5 ${isUser ? "text-background" : "text-foreground"}`}
-                  numberOfLines={6}
-                >
-                  {item.imageAnalysis}
-                </Text>
+            {imageCount > 0 && (
+              <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: item.content ? 8 : 0 }}>
+                {Array.from({ length: imageCount }, (_, index) => {
+                  const uri = previewUris[index];
+                  return uri ? (
+                    <Image
+                      key={index}
+                      source={{ uri }}
+                      style={IMAGE_TILE_STYLE}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <View key={index} style={[IMAGE_TILE_STYLE, IMAGE_PLACEHOLDER_STYLE]}>
+                      <IconSymbol name="photo" size={22} color={isUser ? colors.background : colors.muted} />
+                    </View>
+                  );
+                })}
               </View>
+            )}
+            {item.content ? (
+              isUser ? (
+                <Text selectable style={WEB_SELECTABLE} className="text-background">
+                  {item.content}
+                </Text>
+              ) : (
+                <Markdown style={markdownStyles} rules={SELECTABLE_MARKDOWN_RULES}>
+                  {item.content}
+                </Markdown>
+              )
             ) : null}
           </View>
         </Pressable>
@@ -1068,13 +1108,17 @@ export default function AIScreen() {
           <Text className="text-muted text-xs">
             {new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
           </Text>
-          <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
-            <IconSymbol name="square.on.square" size={13} color={colors.muted} />
-            <Text className="text-muted text-xs ml-1">复制</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => setSelectionTarget(item)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
-            <Text className="text-muted text-xs">选择文字</Text>
-          </TouchableOpacity>
+          {item.content ? (
+            <>
+              <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
+                <IconSymbol name="square.on.square" size={13} color={colors.muted} />
+                <Text className="text-muted text-xs ml-1">复制</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setSelectionTarget(item)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
+                <Text className="text-muted text-xs">选择文字</Text>
+              </TouchableOpacity>
+            </>
+          ) : null}
           {item.role === "assistant" && (
             <TouchableOpacity
               onPress={() => handleSaveNutritionFromText(item.content)}
@@ -1545,24 +1589,38 @@ export default function AIScreen() {
           </View>
         )}
 
-        {/* 待发送图片预览 */}
-        {pendingImage && (
+        {/* 待发送图片：缩略图网格，点右上角 × 单独移除，不加说明文字 */}
+        {pendingImages.length > 0 && (
           <View className="px-5 pt-3">
-            <View className="flex-row items-center rounded-xl border border-border bg-surface p-2">
-              <Image
-                source={{ uri: pendingImage.uri }}
-                style={{ width: 56, height: 56, borderRadius: 8 }}
-                resizeMode="cover"
-              />
-              <View className="flex-1 ml-3">
-                <Text className="text-foreground text-xs" numberOfLines={1}>
-                  {pendingImage.name || "已选择图片"}
-                </Text>
-                <Text className="text-muted text-xs mt-1">发送后由 AI 识别，结果会存进对话记录</Text>
-              </View>
-              <TouchableOpacity onPress={() => setPendingImage(null)} className="p-2" activeOpacity={0.7}>
-                <IconSymbol name="xmark" size={18} color={colors.muted} />
-              </TouchableOpacity>
+            <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+              {pendingImages.map((img, index) => (
+                <View key={index} style={{ marginRight: 6, marginBottom: 6 }}>
+                  <Image
+                    source={{ uri: img.uri }}
+                    style={{ width: 64, height: 64, borderRadius: 8 }}
+                    resizeMode="cover"
+                  />
+                  <TouchableOpacity
+                    onPress={() => setPendingImages((prev) => prev.filter((_, i) => i !== index))}
+                    style={{
+                      position: "absolute",
+                      top: -6,
+                      right: -6,
+                      width: 20,
+                      height: 20,
+                      borderRadius: 10,
+                      backgroundColor: colors.surface,
+                      borderWidth: 1,
+                      borderColor: colors.border,
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <IconSymbol name="xmark" size={12} color={colors.muted} />
+                  </TouchableOpacity>
+                </View>
+              ))}
             </View>
           </View>
         )}
@@ -1582,7 +1640,7 @@ export default function AIScreen() {
               value={inputText}
               onChangeText={setInputText}
               onFocus={() => setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 120)}
-              placeholder={pendingImage ? "补充一句（可留空）..." : "输入消息..."}
+              placeholder={pendingImages.length ? "补充一句（可留空）..." : "输入消息..."}
               placeholderTextColor={colors.muted}
               multiline
               maxLength={1000}
@@ -1598,16 +1656,16 @@ export default function AIScreen() {
             </TouchableOpacity>
             <TouchableOpacity
               onPress={handleSendMessage}
-              disabled={(!inputText.trim() && !pendingImage) || isLoading}
+              disabled={(!inputText.trim() && pendingImages.length === 0) || isLoading}
               className={`w-11 h-11 rounded-full items-center justify-center ${
-                (inputText.trim() || pendingImage) && !isLoading ? "bg-primary" : "bg-muted/30"
+                (inputText.trim() || pendingImages.length > 0) && !isLoading ? "bg-primary" : "bg-muted/30"
               }`}
               activeOpacity={0.8}
             >
               <IconSymbol
                 name="paperplane.fill"
                 size={20}
-                color={(inputText.trim() || pendingImage) && !isLoading ? colors.background : colors.muted}
+                color={(inputText.trim() || pendingImages.length > 0) && !isLoading ? colors.background : colors.muted}
               />
             </TouchableOpacity>
           </View>
@@ -1701,9 +1759,20 @@ export default function AIScreen() {
                       </TouchableOpacity>
                     </View>
                   </View>
-                  <Text selectable className="text-foreground text-xs leading-5" numberOfLines={4}>
-                    {m.content}
-                  </Text>
+                  {m.content ? (
+                    <Text selectable className="text-foreground text-xs leading-5" numberOfLines={4}>
+                      {m.content}
+                    </Text>
+                  ) : (
+                    <View className="flex-row items-center">
+                      {Array.from(
+                        { length: Math.max(m.images?.length ?? 0, m.image ? 1 : 0) },
+                        (_, i) => (
+                          <IconSymbol key={i} name="photo" size={16} color={colors.muted} />
+                        )
+                      )}
+                    </View>
+                  )}
                 </View>
               ))
             )}

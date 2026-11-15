@@ -252,8 +252,7 @@ export interface AIConfig {
 }
 
 // 聊天消息里附带的图片元信息。
-// 不存 base64：图片本体只放在当次会话的内存里，避免 AsyncStorage 被大图撑爆；
-// 持久化的「数据记录」是 imageAnalysis（AI 识别出的文字结果）。
+// 不存 base64：图片本体只放在当次会话的内存里，避免 AsyncStorage 被大图撑爆。
 export interface AIMessageImage {
   name?: string;
   mimeType: string;
@@ -265,8 +264,11 @@ export interface AIMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: string;
+  // 旧版单图字段，保留以兼容已保存的消息；新消息统一用 images。
   image?: AIMessageImage;
-  // 图片识别结果：作为上下文参与回复，并随消息持久化/导出备份。
+  // 一次可附多张图片：只存元信息，图片本体在内存里按消息 id 索引。
+  images?: AIMessageImage[];
+  // 多图识别结果的文字汇总，仅作为模型上下文，不显示在聊天气泡里。
   imageAnalysis?: string;
   // 归档：主聊天列表只显示未归档消息；归档内容仍保存在本地，可在归档箱里删除/恢复。
   archived?: boolean;
