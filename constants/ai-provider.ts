@@ -12,6 +12,11 @@ export const TOKENHUB_VISION_MODEL_EXAMPLE = "qwen-vl-max";
 // 8082 常被 QQ / 其它本机软件占用，改用高位端口；改这里必须同步 scripts/tokenhub-proxy.mjs。
 export const TOKENHUB_WEB_PROXY_URL = "http://127.0.0.1:18082/v1";
 
+// 单次回复的最大输出 token。原来写死 2000：推理型模型会把它全花在 thinking 上，
+// 正文一个字都不剩，上游直接抛 502「empty reply ... spent on reasoning」。
+// 4096 给推理 + 正文都留空间；上游仍有自己的上限时，可在高级设置里继续调大。
+export const DEFAULT_MAX_TOKENS = 4096;
+
 // 用户手填地址时可能带尾斜杠，代码会再拼 /chat/completions，先去掉。
 export function normalizeBaseUrl(url: string): string {
   return (url || TOKENHUB_BASE_URL).trim().replace(/\/+$/, "");

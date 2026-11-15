@@ -39,6 +39,7 @@ import {
   TOKENHUB_DEFAULT_MODEL,
   TOKENHUB_WEB_PROXY_URL,
   TOKENHUB_VISION_MODEL_EXAMPLE,
+  DEFAULT_MAX_TOKENS,
   normalizeBaseUrl,
 } from "@/constants/ai-provider";
 
@@ -150,8 +151,21 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 1): Prom
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
+// 上游把「模型只输出 thinking、正文为空」报成 502，这跟连接无关。
+// 单独识别，避免甩出自建地址 / 跨域 / 明文那一堆误导性排查。
+function describeReasoningError(msg: string): string | null {
+  if (!/empty reply|answered nothing|spent on reasoning|reasoning.*token|max_tokens|token.*limit|输出预算|推理.*耗/i.test(msg)) return null;
+  return (
+    "模型把输出预算全花在推理上，没吐出正文，上游返回了空回复。这不是连接问题，测试连接能过很正常。\n" +
+    "处理：① 高级设置把「最大输出 token」调大到 8192（服务端自己也可能有上限，要在服务端一起调）；" +
+    "② 换非推理型 / 普通模型；③ 关掉「工具调用」减少推理负担；④ 问题问得更具体。"
+  );
+}
+
 // 分诊：以前任何网络失败都甩「浏览器跨域/代理没启动」，真机断网也这么报，纯属误导。
 async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<string> {
+  const reasoning = describeReasoningError(msg);
+  if (reasoning) return reasoning;
   const hint = describeCustomEndpoint(baseUrl);
   const networkish = /failed to fetch|network request failed|load failed|networkerror|timeout|aborted|network|cleartext/i.test(msg);
   if (Platform.OS !== "web") {
@@ -248,6 +262,8 @@ export default function AIScreen() {
   const [baseUrl, setBaseUrl] = useState(state.aiConfig.baseUrl || TOKENHUB_BASE_URL);
   const [model, setModel] = useState(state.aiConfig.model || TOKENHUB_DEFAULT_MODEL);
   const [visionModel, setVisionModel] = useState(state.aiConfig.visionModel || "");
+  const [maxTokens, setMaxTokens] = useState(String(state.aiConfig.maxTokens ?? DEFAULT_MAX_TOKENS));
+  const [toolsEnabled, setToolsEnabled] = useState(state.aiConfig.toolsEnabled ?? true);
   // 已保存的 Key 永不回显到输入框；留空表示沿用旧 Key
   const [apiKey, setApiKey] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -530,6 +546,8 @@ export default function AIScreen() {
         apiKey: effectiveKey,
         model: model || TOKENHUB_DEFAULT_MODEL,
         visionModel: visionModel.trim() || undefined,
+        maxTokens: Math.min(32768, Math.max(512, Number(maxTokens) || DEFAULT_MAX_TOKENS)),
+        toolsEnabled,
         isConfigured: true,
       });
       setApiKey(""); // 立刻清掉输入框，不留在屏幕上
@@ -541,7 +559,12 @@ export default function AIScreen() {
   };
 
   // 调用聊天补全（带工具）；返回解析后的响应 JSON。withTools=false 时退化为纯对话。
-  const callChat = async (messages: any[], withTools = true, modelOverride?: string): Promise<any> => {
+  const callChat = async (
+    messages: any[],
+    withTools = true,
+    modelOverride?: string,
+    tokenOverride?: number
+  ): Promise<any> => {
     // 统一取「配置面板当前值」：以前测试连接用输入框、发消息用已保存值，
     // 用户刚改了自建地址没点保存时就会出现「测试通过、对话却连旧地址」的假象。
     const configBase = normalizeBaseUrl(baseUrl || state.aiConfig.baseUrl || TOKENHUB_BASE_URL);
@@ -550,9 +573,11 @@ export default function AIScreen() {
     const body: Record<string, unknown> = {
       model: modelOverride || model || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
       messages,
-      max_tokens: 2000,
+      // 2000 对推理型模型不够：thinking 吃满预算后正文为空，上游会抛 502 empty reply。
+      max_tokens: tokenOverride ?? Math.min(32768, Math.max(512, Number(maxTokens) || DEFAULT_MAX_TOKENS)),
     };
-    if (withTools) {
+    // 自建 / agent 类网关常不支持 tools，关掉开关后所有请求都退化成纯对话。
+    if (withTools && toolsEnabled) {
       body.tools = AI_TOOLS;
       body.tool_choice = "auto";
     }
@@ -603,7 +628,14 @@ export default function AIScreen() {
     ];
     const data = await callChat(messages, false, vision || undefined);
     const text = String(data?.choices?.[0]?.message?.content ?? "").trim();
-    if (!text) throw new Error("视觉模型没有返回识别结果");
+    if (!text) throw new Error("视觉模型没有返回识别结果（输出预算太小，或模型/网关不支持图片）");
+    // 网关不支持 image_url 时，模型往往只收到文字，会客气地回一句「我看不到图片」。
+    // 旧逻辑把这句当成识别结果存进记录，后续主模型就跟着说「当前环境读不到图片内容」。
+    if (/看不到|看不清|无法查看|无法读取|读不到|没有收到图片|未提供图片|不支持图片|无法访问图片|无法识别图片|cannot (see|view|access)|no image|unable to (see|view|process).*image/i.test(text)) {
+      throw new Error(
+        `网关或模型没拿到图片：${text.slice(0, 100)}。请到「高级设置 → 视觉模型」填支持视觉的 ID（点「查模型名」找带 vl / vision 的）；自建网关还必须支持 OpenAI 的 image_url 数组格式，否则图片会被丢弃。`
+      );
+    }
     return text;
   };
 
@@ -659,7 +691,9 @@ export default function AIScreen() {
             ? `当前模型可能不支持图片。到「高级设置 → 视觉模型」填一个支持视觉的 ID（点「查模型名」从 /v1/models 找带 vl / vision 的，例如 ${TOKENHUB_VISION_MODEL_EXAMPLE}）再重发。`
             : await diagnoseNetworkError(raw, baseUrl);
           notify("失败 · 图片识别未完成", `${raw}\n${hint}`);
-          addAIMessage({ role: "assistant", content: `图片识别失败：${hint}` });
+          // 原始错误也写进对话记录：以前只存 hint，模型看不到真实原因，
+          // 只能根据上下文猜「当前环境读不到图片内容」。
+          addAIMessage({ role: "assistant", content: `图片识别失败：${raw}\n${hint}` });
           return; // 用户图片消息已保存，不会消失；finally 会收尾
         }
         // 识别结果写回这条消息 → 随聊天记录持久化/导出，就是「对应数据记录」
@@ -694,10 +728,15 @@ export default function AIScreen() {
         try {
           data = await callChat(conversation);
         } catch (err) {
-          // 首轮若因模型不支持工具而失败，自动退化为纯对话
+          // 首轮失败自动降级一次：去掉工具 schema（很多自建网关不支持 tools），
+          // 并把输出预算拉到 8192（推理型模型常把小预算全花在 thinking 上）。
           const msg = err instanceof Error ? err.message : String(err);
-          if (turn === 0 && /tool|function|not support|unsupported|参数/i.test(msg)) {
-            data = await callChat(conversation, false);
+          const fallback =
+            turn === 0 &&
+            (/tool|function|not support|unsupported|参数/i.test(msg) || !!describeReasoningError(msg));
+          if (fallback) {
+            const bigger = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
+            data = await callChat(conversation, false, undefined, bigger);
           } else {
             throw err;
           }
@@ -726,7 +765,12 @@ export default function AIScreen() {
           continue; // 带着工具结果再问一次模型
         }
 
-        finalText = msg.content || "";
+        finalText = String(msg.content ?? "").trim();
+        if (!finalText) {
+          // 有些推理模型只给 reasoning_content，content 为空；别再回一句莫名其妙的「无法回应」。
+          finalText =
+            "模型这次没返回正文（多半把输出预算全花在推理上）。到「高级设置 → 最大输出 token」调大到 8192，或换非推理型模型后重发。";
+        }
         conversation.push({ role: "assistant", content: finalText });
         break;
       }
@@ -736,7 +780,10 @@ export default function AIScreen() {
       } else if (executedCount > 0) {
         addAIMessage({ role: "assistant", content: "（已为你执行上述操作）" });
       } else {
-        addAIMessage({ role: "assistant", content: "抱歉，我暂时无法回应，请稍后再试。" });
+        addAIMessage({
+          role: "assistant",
+          content: "连续几轮都没拿到模型正文。多半是输出预算太小或工具调用不被网关支持：到「高级设置」把最大输出调到 8192，必要时关掉工具调用再重发。",
+        });
       }
     } catch (error) {
       addAIMessage({
@@ -1161,9 +1208,46 @@ export default function AIScreen() {
               autoCorrect={false}
             />
             <Text className="text-muted text-xs mt-2 leading-5">
-              发图片时先用这个模型识别，再把识别结果交给主模型回答。若报「不支持图片」，点「查模型名」找带 vl / vision 的 ID 填这里。
+              发图片时先用这个模型识别，再把识别结果交给主模型回答。若报「不支持图片」，点「查模型名」找带 vl / vision 的 ID 填这里。自建 / agent 类网关还得支持 OpenAI 的 image_url 数组格式，否则图片会被直接丢掉，模型只会说「看不到图片」。
             </Text>
           </View>
+
+          {/* 最大输出 token：推理型模型需要给 thinking + 正文都留预算 */}
+          <View className="mb-4">
+            <Text className="text-muted text-sm mb-2">最大输出 token（推理型模型建议 8192）</Text>
+            <TextInput
+              value={maxTokens}
+              onChangeText={setMaxTokens}
+              keyboardType="numeric"
+              placeholder={String(DEFAULT_MAX_TOKENS)}
+              placeholderTextColor={colors.muted}
+              className="bg-background rounded-xl px-4 py-3 text-foreground border border-border"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            <Text className="text-muted text-xs mt-2 leading-5">
+              报「empty reply / spent on reasoning」就是预算被推理吃光、正文一个字没剩，调大这里或换普通模型。服务端自己也可能有上限，要一起调。
+            </Text>
+          </View>
+
+          {/* 工具调用开关：自建网关常不支持 tools */}
+          <TouchableOpacity
+            onPress={() => setToolsEnabled(!toolsEnabled)}
+            className="flex-row items-center mb-4"
+            activeOpacity={0.7}
+          >
+            <View className="flex-1 mr-3">
+              <Text className="text-foreground text-sm">允许 AI 调用工具</Text>
+              <Text className="text-muted text-xs mt-1 leading-5">
+                关掉后只聊天、不再自动改训练/饮食/资料。自建或 agent 类网关常不支持 tools，关掉也能明显减少推理负担。
+              </Text>
+            </View>
+            <View
+              className={`w-11 h-6 rounded-full justify-center px-0.5 ${toolsEnabled ? "bg-primary items-end" : "bg-muted/30 items-start"}`}
+            >
+              <View className="w-5 h-5 rounded-full bg-background" />
+            </View>
+          </TouchableOpacity>
 
             </>
           )}

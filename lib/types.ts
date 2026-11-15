@@ -242,6 +242,10 @@ export interface AIConfig {
   model?: string;
   // 图片识别用的视觉模型；留空则复用上面的主模型（多数纯文本模型不支持图片）。
   visionModel?: string;
+  // 单次回复最大输出 token（推理型模型需要更大预算，否则只输出 thinking 没有正文）。
+  maxTokens?: number;
+  // 是否把工具 schema 一起发给模型。自建 / agent 类网关常不支持 tools，关掉可显著降低推理负担。
+  toolsEnabled?: boolean;
   isConfigured: boolean;
 }
 

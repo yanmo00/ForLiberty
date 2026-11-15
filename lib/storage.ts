@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
-import { TOKENHUB_BASE_URL, TOKENHUB_DEFAULT_MODEL } from '../constants/ai-provider';
+import { TOKENHUB_BASE_URL, TOKENHUB_DEFAULT_MODEL, DEFAULT_MAX_TOKENS } from '../constants/ai-provider';
 import { DEFAULT_SETS, DEFAULT_REPS } from '../constants/workout-defaults';
 import type {
   Exercise,
@@ -53,6 +53,8 @@ export const DEFAULT_AI_CONFIG: AIConfig = {
   provider: 'tokenhub',
   baseUrl: TOKENHUB_BASE_URL,
   model: TOKENHUB_DEFAULT_MODEL,
+  maxTokens: DEFAULT_MAX_TOKENS,
+  toolsEnabled: true,
   isConfigured: false,
 };
 
