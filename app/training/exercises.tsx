@@ -7,6 +7,7 @@ import { useColors } from "@/hooks/use-colors";
 import { useApp } from "@/lib/app-context";
 import type { Exercise, MuscleGroup, Equipment } from "@/lib/types";
 import { MUSCLE_GROUP_NAMES, EQUIPMENT_NAMES } from "@/lib/types";
+import { DEFAULT_SETS, DEFAULT_REPS } from "@/constants/workout-defaults";
 
 const MUSCLE_GROUPS: MuscleGroup[] = ["chest", "back", "shoulders", "arms", "legs", "core"];
 const EQUIPMENT_LIST: Equipment[] = ["barbell", "dumbbell", "cable", "machine", "bodyweight", "kettlebell", "bands", "other"];
@@ -26,8 +27,8 @@ export default function ExercisesScreen() {
   const [muscleGroup, setMuscleGroup] = useState<MuscleGroup>("chest");
   const [equipment, setEquipment] = useState<Equipment>("barbell");
   const [description, setDescription] = useState("");
-  const [defaultSets, setDefaultSets] = useState("");
-  const [defaultReps, setDefaultReps] = useState("");
+  const [defaultSets, setDefaultSets] = useState(String(DEFAULT_SETS));
+  const [defaultReps, setDefaultReps] = useState(String(DEFAULT_REPS));
   const [defaultWeight, setDefaultWeight] = useState("");
 
   const filteredExercises = useMemo(() => {
@@ -52,8 +53,8 @@ export default function ExercisesScreen() {
     setMuscleGroup("chest");
     setEquipment("barbell");
     setDescription("");
-    setDefaultSets("");
-    setDefaultReps("");
+    setDefaultSets(String(DEFAULT_SETS));
+    setDefaultReps(String(DEFAULT_REPS));
     setDefaultWeight("");
   };
 
@@ -73,8 +74,8 @@ export default function ExercisesScreen() {
     setMuscleGroup(exercise.muscleGroup);
     setEquipment(exercise.equipment);
     setDescription(exercise.description || "");
-    setDefaultSets(exercise.defaultSets ? String(exercise.defaultSets) : "");
-    setDefaultReps(exercise.defaultReps ? String(exercise.defaultReps) : "");
+    setDefaultSets(String(exercise.defaultSets ?? DEFAULT_SETS));
+    setDefaultReps(String(exercise.defaultReps ?? DEFAULT_REPS));
     setDefaultWeight(exercise.defaultWeight ? String(exercise.defaultWeight) : "");
     setShowFormModal(true);
   };

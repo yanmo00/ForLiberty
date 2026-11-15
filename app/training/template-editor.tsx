@@ -8,6 +8,7 @@ import { ExercisePicker } from "@/components/exercise-picker";
 import { useApp } from "@/lib/app-context";
 import { generateId, getTodayString } from "@/lib/storage";
 import { MUSCLE_GROUP_NAMES, type MuscleGroup, type TemplateDay, type TemplateExercise, type Exercise } from "@/lib/types";
+import { DEFAULT_SETS, DEFAULT_REPS } from "@/constants/workout-defaults";
 
 const MUSCLE_GROUPS: MuscleGroup[] = ["chest", "back", "shoulders", "arms", "legs", "core"];
 
@@ -89,8 +90,8 @@ export default function TemplateEditorScreen() {
         id: generateId(),
         exerciseId: exercise.id,
         order: day.exercises.length + 1,
-        sets: exercise.defaultSets ?? 3,
-        reps: exercise.defaultReps ?? 10,
+        sets: exercise.defaultSets ?? DEFAULT_SETS,
+        reps: exercise.defaultReps ?? DEFAULT_REPS,
         weight: exercise.defaultWeight,
       };
       return {

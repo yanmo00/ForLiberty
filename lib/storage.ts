@@ -2,6 +2,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { TOKENHUB_BASE_URL, TOKENHUB_DEFAULT_MODEL } from '../constants/ai-provider';
+import { DEFAULT_SETS, DEFAULT_REPS } from '../constants/workout-defaults';
 import type {
   Exercise,
   WorkoutTemplate,
@@ -146,8 +147,8 @@ function normalizeTemplateDays(rawDays: any[], exercises: Exercise[]) {
         id: ex.id ?? generateId(),
         exerciseId: ex.exerciseId ?? ex.id,
         order: Number(ex.order ?? exIndex + 1),
-        sets: Number(ex.sets ?? 3),
-        reps: Number(ex.reps ?? 10),
+        sets: Number(ex.sets ?? DEFAULT_SETS),
+        reps: Number(ex.reps ?? DEFAULT_REPS),
         weight: ex.weight !== undefined ? Number(ex.weight) : undefined,
         restSeconds: ex.restSeconds !== undefined ? Number(ex.restSeconds) : undefined,
         notes: ex.notes,
@@ -157,8 +158,8 @@ function normalizeTemplateDays(rawDays: any[], exercises: Exercise[]) {
         id: generateId(),
         exerciseId: id,
         order: exIndex + 1,
-        sets: 3,
-        reps: 10,
+        sets: DEFAULT_SETS,
+        reps: DEFAULT_REPS,
       }));
     } else if (Array.isArray(day.exerciseNames)) {
       exercisesList = day.exerciseNames
@@ -169,8 +170,8 @@ function normalizeTemplateDays(rawDays: any[], exercises: Exercise[]) {
             id: generateId(),
             exerciseId,
             order: exIndex + 1,
-            sets: 3,
-            reps: 10,
+            sets: DEFAULT_SETS,
+            reps: DEFAULT_REPS,
           };
         })
         .filter(Boolean);

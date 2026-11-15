@@ -1,5 +1,6 @@
 import { boolean, date, float, int, json, mysqlEnum, mysqlTable, text, timestamp, varchar } from "drizzle-orm/mysql-core";
 import { relations } from "drizzle-orm";
+import { DEFAULT_REPS } from "../constants/workout-defaults";
 
 /**
  * Core user table backing auth flow.
@@ -81,7 +82,7 @@ export const workoutTemplateExercises = mysqlTable("workout_template_exercises",
   exerciseId: int("exerciseId").notNull().references(() => exercises.id),
   order: int("order").notNull(),
   sets: int("sets").default(3),
-  reps: int("reps").default(10),
+  reps: int("reps").default(DEFAULT_REPS),
   weight: float("weight"), // Target weight
   notes: text("notes"),
 });

@@ -10,6 +10,7 @@ import type {
 import { generateId, getTodayString } from "../storage";
 import { buildCustomNutritionPlan, formatPlanSummary } from "../nutrition-plan";
 import { summarizeNutritionLogItem } from "../nutrition-log";
+import { DEFAULT_SETS, DEFAULT_REPS } from "../../constants/workout-defaults";
 
 export interface ToolResult {
   ok: boolean;
@@ -70,8 +71,8 @@ export const AI_TOOLS: Record<string, unknown>[] = [
             ],
           },
           description: { type: "string" },
-          defaultSets: { type: "number" },
-          defaultReps: { type: "number" },
+          defaultSets: { type: "number", description: `默认组数，省略为 ${DEFAULT_SETS}` },
+          defaultReps: { type: "number", description: `默认次数，省略为 ${DEFAULT_REPS}` },
           defaultWeight: { type: "number" },
         },
         required: ["name"],
@@ -468,8 +469,8 @@ export async function executeToolCall(
           muscleGroup: (args.muscleGroup ?? "legs") as MuscleGroup,
           equipment: (args.equipment ?? "other") as Equipment,
           description: args.description,
-          defaultSets: args.defaultSets,
-          defaultReps: args.defaultReps,
+          defaultSets: args.defaultSets ?? DEFAULT_SETS,
+          defaultReps: args.defaultReps ?? DEFAULT_REPS,
           defaultWeight: args.defaultWeight,
         });
         return { ok: true, summary: `已添加动作：${ex.name}` };
@@ -501,8 +502,8 @@ export async function executeToolCall(
               id: generateId(),
               exerciseId: e.id,
               order: exercises.length,
-              sets: ex.sets ?? 3,
-              reps: ex.reps ?? 10,
+              sets: ex.sets ?? DEFAULT_SETS,
+              reps: ex.reps ?? DEFAULT_REPS,
               weight: ex.weight,
               restSeconds: ex.restSeconds,
               notes: ex.notes,
@@ -578,12 +579,12 @@ export async function executeToolCall(
           setIndex: args.setIndex ?? app.state.currentSession.sets.length,
           isWarmup: args.isWarmup ?? false,
           weight: args.weight ?? 0,
-          reps: args.reps ?? 0,
+          reps: args.reps ?? DEFAULT_REPS,
           restSeconds: args.restSeconds,
         });
         return {
           ok: true,
-          summary: `已添加第 ${app.state.currentSession.sets.length + 1} 组：${ex.name} ${args.weight ?? 0}×${args.reps ?? 0}`,
+          summary: `已添加第 ${app.state.currentSession.sets.length + 1} 组：${ex.name} ${args.weight ?? 0}×${args.reps ?? DEFAULT_REPS}`,
         };
       }
 

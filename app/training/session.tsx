@@ -9,6 +9,7 @@ import { useApp } from "@/lib/app-context";
 import { getCurrentTimeString } from "@/lib/storage";
 import type { WorkoutSet, Exercise } from "@/lib/types";
 import { MUSCLE_GROUP_NAMES } from "@/lib/types";
+import { DEFAULT_REPS } from "@/constants/workout-defaults";
 import * as Haptics from "expo-haptics";
 
 export default function WorkoutSessionScreen() {
@@ -19,7 +20,7 @@ export default function WorkoutSessionScreen() {
   const [selectedExercise, setSelectedExercise] = useState<Exercise | null>(null);
   const [showExercisePicker, setShowExercisePicker] = useState(false);
   const [weight, setWeight] = useState("");
-  const [reps, setReps] = useState("");
+  const [reps, setReps] = useState(String(DEFAULT_REPS));
   const [isWarmup, setIsWarmup] = useState(false);
   
   // 休息计时器状态
@@ -98,7 +99,8 @@ export default function WorkoutSessionScreen() {
     if (planned?.weight && weight === "") {
       setWeight(String(planned.weight));
     }
-    if (planned?.reps && reps === "") {
+    // 计划动作的次数优先；用户手动改过（不等于默认值）就不再覆盖。
+    if (planned?.reps && (reps === "" || reps === String(DEFAULT_REPS))) {
       setReps(String(planned.reps));
     }
   }, [selectedExercise, state.currentSession?.plan?.exercises, weight, reps]);
@@ -161,8 +163,8 @@ export default function WorkoutSessionScreen() {
 
     addSetToSession(newSet);
     
-    // 重置输入但保留重量（通常下一组重量相同）
-    setReps("");
+    // 重置输入但保留重量（通常下一组重量相同）；次数回到统一默认值
+    setReps(String(DEFAULT_REPS));
     setIsWarmup(false);
     
     // 开始休息计时
