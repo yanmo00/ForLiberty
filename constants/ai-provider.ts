@@ -9,7 +9,8 @@ export const TOKENHUB_DEFAULT_MODEL = "qwen3.7-max";
 export const TOKENHUB_VISION_MODEL_EXAMPLE = "qwen-vl-max";
 // Web 预览专用：网关不返回 CORS 头，浏览器直连必被拦，改走本机同源代理。
 // 真机 App 直连官方域名，不经过这里。
-export const TOKENHUB_WEB_PROXY_URL = "http://127.0.0.1:8082/v1";
+// 8082 常被 QQ / 其它本机软件占用，改用高位端口；改这里必须同步 scripts/tokenhub-proxy.mjs。
+export const TOKENHUB_WEB_PROXY_URL = "http://127.0.0.1:18082/v1";
 
 // 用户手填地址时可能带尾斜杠，代码会再拼 /chat/completions，先去掉。
 export function normalizeBaseUrl(url: string): string {

@@ -13,6 +13,7 @@ import {
   Modal,
   Pressable,
   ScrollView,
+  useWindowDimensions,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
@@ -110,16 +111,26 @@ function describeFailure(status: number, body: string): string {
   return `HTTP ${status}：${body.slice(0, 160)}`;
 }
 
-// 只判断代理端口在不在监听；no-cors 可避开 CORS 头干扰（局域网 IP 打开时也能测）。
+// 校验「确实是本项目代理」：端口被 QQ 等软件占用时，no-cors 会把 404 也当成在线，
+// 结果状态条显示代理在线、AI 请求却直接失败。优先读 /__health 的 {"ok":true}；
+// 只有 CORS 被拦（例如用局域网 IP 打开预览）才退化成「端口在不在」的粗判。
 async function pingProxy(): Promise<boolean> {
   if (Platform.OS !== "web") return false;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 1500);
+  const url = proxyHealthUrl();
   try {
-    await fetch(proxyHealthUrl(), { mode: "no-cors", signal: controller.signal });
-    return true;
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return false;
+    const body = await res.json().catch(() => null);
+    return body?.ok === true;
   } catch {
-    return false;
+    try {
+      await fetch(url, { mode: "no-cors", signal: controller.signal });
+      return true;
+    } catch {
+      return false;
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -150,7 +161,7 @@ async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<stri
   }
   const alive = await pingProxy();
   if (!alive) {
-    return `本机代理没启动（或已退出 / 8082 被占用）。关掉预览，重新运行 npm run dev:web 一次启动代理+预览；只用 npx expo start --web 不会有代理。${hint}`;
+    return `本机代理没启动（或已退出 / 18082 被别的软件占用）。关掉预览，重新运行 npm run dev:web 一次启动代理+预览；只用 npx expo start --web 不会有代理。${hint}`;
   }
   return networkish
     ? `本机代理在线，但这次请求仍失败：多为上游不通、网关超时或断网（已自动重试一次）。点「测试连接」看具体状态码；自定义地址也会经代理转发，请确认上游服务可达。${hint}`
@@ -261,6 +272,13 @@ export default function AIScreen() {
   // 软键盘：KAV 上方固定内容的高度；键盘高度/显隐与其它页面共用同一个 hook
   const [topOffset, setTopOffset] = useState(0);
   const { height: keyboardHeight, visible: keyboardVisible } = useKeyboardOverlap();
+  // 配置面板是页面里唯一需要自己滚动的区域：头部/状态栏/结果条/底部按钮都常驻，
+  // 只给表单区一个上限高度，避免内容把聊天区挤没、也避免超出屏幕被裁掉无法下滑。
+  const { height: windowHeight } = useWindowDimensions();
+  const configMaxHeight = Math.max(
+    180,
+    Math.round((Math.max(360, windowHeight - keyboardHeight)) * (notice ? 0.46 : 0.54))
+  );
   // Web 预览时本机代理是否在线：一眼能看出「请求失败」是不是代理没起导致的
   const [proxyAlive, setProxyAlive] = useState<boolean | null>(null);
 
@@ -871,8 +889,12 @@ export default function AIScreen() {
   // AI 界面自带只包「消息列表 + 输入区」的 KAV，关掉容器层规避以免叠加
   return (
     <ScreenContainer edges={["top", "left", "right", "bottom"]} className="flex-1" keyboardAware={false}>
-      {/* KAV 上方的固定内容：量出高度给 iOS 的 keyboardVerticalOffset 用 */}
-      <View onLayout={(e) => setTopOffset(e.nativeEvent.layout.height)}>
+      {/* KAV 上方的固定内容：量出高度给 iOS 的 keyboardVerticalOffset 用。
+          flexShrink=0 保证聊天区只拿「剩余高度」，不会把配置区压扁或顶出屏幕。 */}
+      <View
+        onLayout={(e) => setTopOffset(e.nativeEvent.layout.height)}
+        style={{ flexShrink: 0 }}
+      >
       {/* 头部 */}
       <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
         <TouchableOpacity onPress={() => router.back()} className="p-1">
@@ -932,7 +954,7 @@ export default function AIScreen() {
           style={{ backgroundColor: "rgba(239,68,68,0.10)", borderColor: "rgba(239,68,68,0.4)", borderWidth: 1 }}
         >
           <Text className="text-foreground text-xs leading-5">
-            本机代理未启动：关掉预览，运行 npm run dev:web 一次启动「代理 8082 + 预览 8081」；只跑 npx expo start --web 不会有代理。
+            本机代理未启动：关掉预览，运行 npm run dev:web 一次启动「代理 18082 + 预览 8081」；只跑 npx expo start --web 不会有代理。
           </Text>
         </View>
       )}
@@ -967,13 +989,29 @@ export default function AIScreen() {
               <Text className="text-muted text-sm">✕</Text>
             </TouchableOpacity>
           </View>
-          <Text className="text-foreground text-xs mt-2 leading-5">{notice.text}</Text>
+          {/* 诊断文本可能很长（EasyTier 排查 4 条），单独限高并允许滚动，
+              否则结果条会把下面的配置面板和保存按钮一起挤出屏幕 */}
+          <ScrollView
+            style={{ maxHeight: 130, flexGrow: 0, flexShrink: 0, marginTop: 8 }}
+            nestedScrollEnabled
+            showsVerticalScrollIndicator
+          >
+            <Text className="text-foreground text-xs leading-5">{notice.text}</Text>
+          </ScrollView>
         </View>
       )}
 
-      {/* 配置面板 */}
+      {/* 配置面板：表单区自己滚动（Web 滚轮 / 原生手指），操作按钮常驻底部 */}
       {showConfig && (
-        <View className="px-5 py-4 border-b border-border bg-surface">
+        <>
+        <ScrollView
+          style={{ maxHeight: configMaxHeight, flexGrow: 0, flexShrink: 0 }}
+          contentContainerStyle={{ flexGrow: 0 }}
+          keyboardShouldPersistTaps="handled"
+          nestedScrollEnabled
+          showsVerticalScrollIndicator
+        >
+        <View className="px-5 pt-4 pb-2 bg-surface">
           <Text className="text-foreground font-semibold mb-1">智云 TokenHub</Text>
           <Text className="text-muted text-xs mb-1">
             {TOKENHUB_CONSOLE_URL} → 个人中心 → 账户管理 → 密钥管理，复制 API Key
@@ -1130,29 +1168,31 @@ export default function AIScreen() {
             </>
           )}
 
-          {/* 操作按钮 */}
-          <View className="flex-row gap-3">
-            <TouchableOpacity
-              onPress={handleTestConnection}
-              disabled={isTesting}
-              className="flex-1 bg-muted/20 rounded-xl py-3 items-center"
-              activeOpacity={0.8}
-            >
-              {isTesting ? (
-                <ActivityIndicator size="small" color={colors.foreground} />
-              ) : (
-                <Text className="text-foreground font-medium">测试连接</Text>
-              )}
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={handleSaveConfig}
-              className="flex-1 bg-primary rounded-xl py-3 items-center"
-              activeOpacity={0.8}
-            >
-              <Text className="text-background font-semibold">保存配置</Text>
-            </TouchableOpacity>
-          </View>
         </View>
+        </ScrollView>
+        {/* 按钮放在滚动区外：滚到模型列表深处也能直接点「保存配置」 */}
+        <View className="flex-row gap-3 px-5 py-3 border-b border-border bg-surface">
+          <TouchableOpacity
+            onPress={handleTestConnection}
+            disabled={isTesting}
+            className="flex-1 bg-muted/20 rounded-xl py-3 items-center"
+            activeOpacity={0.8}
+          >
+            {isTesting ? (
+              <ActivityIndicator size="small" color={colors.foreground} />
+            ) : (
+              <Text className="text-foreground font-medium">测试连接</Text>
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={handleSaveConfig}
+            className="flex-1 bg-primary rounded-xl py-3 items-center"
+            activeOpacity={0.8}
+          >
+            <Text className="text-background font-semibold">保存配置</Text>
+          </TouchableOpacity>
+        </View>
+        </>
       )}
 
       </View>

@@ -11,7 +11,7 @@ import http from "node:http";
 // 默认只监听本机；需要手机走局域网预览时用 `npm run dev:lan`（TOKENHUB_PROXY_HOST=0.0.0.0）。
 const HOST = process.env.TOKENHUB_PROXY_HOST || "127.0.0.1";
 const LAN_MODE = HOST === "0.0.0.0";
-const PORT = Number(process.env.TOKENHUB_PROXY_PORT || 8082);
+const PORT = Number(process.env.TOKENHUB_PROXY_PORT || 18082);
 const UPSTREAM = "https://aigw.telecomjs.com";
 // 本机模式只放行 localhost 预览页；局域网模式额外放行私有网段，仍不放行公网。
 const ALLOWED_ORIGIN = LAN_MODE
@@ -146,7 +146,7 @@ const server = http.createServer(async (req, res) => {
 // 端口被占时别静默退出：concurrently 会把预览一起停掉，比「代理没了但页面还在、一直报跨域」好排查。
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`端口 ${PORT} 已被占用：可能另一个代理还在跑。关掉旧终端，或换端口 TOKENHUB_PROXY_PORT=8083 并同步改页面里的代理地址。`);
+    console.error(`端口 ${PORT} 已被占用：可能另一个代理还在跑，或被 QQ 等软件占了。关掉旧终端，或换端口 TOKENHUB_PROXY_PORT=18083 并同步改 constants/ai-provider.ts 里的代理地址。`);
   } else {
     console.error(`代理启动失败：${err.message}`);
   }
