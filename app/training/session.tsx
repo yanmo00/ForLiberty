@@ -88,22 +88,26 @@ export default function WorkoutSessionScreen() {
     }
   }, [selectedExercise, state.currentSession?.plan?.exercises, state.exercises]);
 
+  // 只在「切换动作」时把计划值带进输入框。
+  // 以前把 weight/reps 放进依赖数组：用户删到空字符串时，effect 立刻把计划值写回去，
+  // 表现就是「删掉一个字符又自动恢复」。输入过程中绝不再回写。
+  const syncedExerciseIdRef = useRef<string | null>(null);
   useEffect(() => {
     if (!selectedExercise) return;
+    if (syncedExerciseIdRef.current === selectedExercise.id) return;
+    syncedExerciseIdRef.current = selectedExercise.id;
     const planned = state.currentSession?.plan?.exercises?.find(
       (exercise) => exercise.exerciseId === selectedExercise.id
     );
     if (planned?.restSeconds) {
       setTargetRestSeconds(planned.restSeconds);
     }
-    if (planned?.weight && weight === "") {
+    if (planned?.weight) {
       setWeight(String(planned.weight));
     }
-    // 计划动作的次数优先；用户手动改过（不等于默认值）就不再覆盖。
-    if (planned?.reps && (reps === "" || reps === String(DEFAULT_REPS))) {
-      setReps(String(planned.reps));
-    }
-  }, [selectedExercise, state.currentSession?.plan?.exercises, weight, reps]);
+    // 计划动作的次数优先；没有计划时用统一默认值 12。
+    setReps(String(planned?.reps ?? DEFAULT_REPS));
+  }, [selectedExercise, state.currentSession?.plan?.exercises]);
 
   const formatTime = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -163,8 +167,11 @@ export default function WorkoutSessionScreen() {
 
     addSetToSession(newSet);
     
-    // 重置输入但保留重量（通常下一组重量相同）；次数回到统一默认值
-    setReps(String(DEFAULT_REPS));
+    // 重置输入但保留重量（通常下一组重量相同）；次数回到计划值或统一默认值
+    const plannedReps = state.currentSession?.plan?.exercises?.find(
+      (ex) => ex.exerciseId === selectedExercise.id
+    )?.reps;
+    setReps(String(plannedReps ?? DEFAULT_REPS));
     setIsWarmup(false);
     
     // 开始休息计时

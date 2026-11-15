@@ -164,6 +164,9 @@ export default function TemplateEditorScreen() {
         ...day,
         exercises: day.exercises.map((exercise, index) => ({
           ...exercise,
+          // 输入框删空时内部暂存 0，保存前兜回默认值，别把「0 组 × 0 次」写进模板
+          sets: exercise.sets || DEFAULT_SETS,
+          reps: exercise.reps || DEFAULT_REPS,
           order: index + 1,
         })),
       })),
@@ -332,7 +335,7 @@ export default function TemplateEditorScreen() {
                       <TextInput
                         style={[styles.numberInput, { color: colors.text, borderColor: colors.border }]}
                         keyboardType="numeric"
-                        value={String(exercise.sets)}
+                        value={exercise.sets ? String(exercise.sets) : ""}
                         onChangeText={(value) => updateExercise(exercise.id, "sets", value)}
                       />
                     </View>
@@ -341,7 +344,7 @@ export default function TemplateEditorScreen() {
                       <TextInput
                         style={[styles.numberInput, { color: colors.text, borderColor: colors.border }]}
                         keyboardType="numeric"
-                        value={String(exercise.reps)}
+                        value={exercise.reps ? String(exercise.reps) : ""}
                         onChangeText={(value) => updateExercise(exercise.id, "reps", value)}
                       />
                     </View>
