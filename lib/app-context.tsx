@@ -99,7 +99,8 @@ type AppAction =
   | { type: 'UPDATE_AI_CONFIG'; payload: Partial<AIConfig> }
   | { type: 'ADD_AI_MESSAGE'; payload: AIMessage }
   | { type: 'UPDATE_AI_MESSAGE'; payload: { id: string; patch: Partial<AIMessage> } }
-  | { type: 'SET_AI_MESSAGES'; payload: AIMessage[] }
+  // 允许传 updater：归档/删除连点、AI 同一轮写消息时，避免调用方拿着旧整表把新消息覆盖掉。
+  | { type: 'SET_AI_MESSAGES'; payload: AIMessage[] | ((prev: AIMessage[]) => AIMessage[]) }
   | { type: 'CLEAR_AI_MESSAGES' }
   | {
       type: 'START_WORKOUT_SESSION';
@@ -296,9 +297,15 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ),
       };
 
-    // 归档 / 删除单条 / 清空归档：整表替换，持久化仍由统一的串行 effect 负责。
+    // 归档 / 删除单条 / 清空归档：整表替换或函数式更新，持久化仍由统一的串行 effect 负责。
     case 'SET_AI_MESSAGES':
-      return { ...state, aiMessages: action.payload };
+      return {
+        ...state,
+        aiMessages:
+          typeof action.payload === 'function'
+            ? action.payload(state.aiMessages)
+            : action.payload,
+      };
 
     case 'CLEAR_AI_MESSAGES':
       return { ...state, aiMessages: [] };
@@ -411,7 +418,7 @@ export interface AppContextType {
   // 返回落库后的完整消息，便于调用方把图片预览等临时数据挂到这条消息上。
   addAIMessage: (message: Omit<AIMessage, 'id' | 'timestamp'>) => AIMessage;
   updateAIMessage: (id: string, patch: Partial<AIMessage>) => void;
-  setAIMessages: (messages: AIMessage[]) => void;
+  setAIMessages: (messages: AIMessage[] | ((prev: AIMessage[]) => AIMessage[])) => void;
   clearAIMessages: () => Promise<void>;
   getExerciseById: (id: string) => Exercise | undefined;
   getSessionsByDate: (date: string) => WorkoutSession[];
@@ -847,9 +854,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'UPDATE_AI_MESSAGE', payload: { id, patch } });
   }, []);
 
-  const setAIMessages = useCallback((messages: AIMessage[]) => {
-    dispatch({ type: 'SET_AI_MESSAGES', payload: messages });
-  }, []);
+  const setAIMessages = useCallback(
+    (messages: AIMessage[] | ((prev: AIMessage[]) => AIMessage[])) => {
+      dispatch({ type: 'SET_AI_MESSAGES', payload: messages });
+    },
+    []
+  );
 
   const clearAIMessages = useCallback(async () => {
     dispatch({ type: 'CLEAR_AI_MESSAGES' });

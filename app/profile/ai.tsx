@@ -910,7 +910,7 @@ export default function AIScreen() {
   // 清除当前对话：只清主视图，归档箱里的内容不动（要删去归档箱）。
   const handleClearMessages = () => {
     const doClear = () => {
-      setAIMessages(archivedMessages);
+      setAIMessages((prev) => prev.filter((m) => m.archived));
       notify("成功 · 已清除", `已清空当前 ${activeMessages.length} 条消息；归档箱里 ${archivedMessages.length} 条未动`);
     };
     if (Platform.OS === "web") {
@@ -927,23 +927,28 @@ export default function AIScreen() {
   const handleArchiveAll = () => {
     if (activeMessages.length === 0) return;
     const ids = new Set(activeMessages.map((m) => m.id));
-    setAIMessages(state.aiMessages.map((m) => (ids.has(m.id) ? { ...m, archived: true } : m)));
+    setAIMessages((prev) => prev.map((m) => (ids.has(m.id) ? { ...m, archived: true } : m)));
     notify("成功 · 已归档", `${activeMessages.length} 条消息移入归档箱，主列表已清爽`);
     setAtBottom(true);
   };
 
+  // 单条归档：翻历史时不想整批收走，可以只把这一条移进归档箱。
+  const archiveOneMessage = (id: string) => {
+    setAIMessages((prev) => prev.map((m) => (m.id === id ? { ...m, archived: true } : m)));
+  };
+
   const deleteOneMessage = (id: string) => {
-    setAIMessages(state.aiMessages.filter((m) => m.id !== id));
+    setAIMessages((prev) => prev.filter((m) => m.id !== id));
   };
 
   const restoreOneMessage = (id: string) => {
-    setAIMessages(state.aiMessages.map((m) => (m.id === id ? { ...m, archived: false } : m)));
+    setAIMessages((prev) => prev.map((m) => (m.id === id ? { ...m, archived: false } : m)));
     setAtBottom(true);
   };
 
   const clearArchive = () => {
     const doClear = () => {
-      setAIMessages(activeMessages);
+      setAIMessages((prev) => prev.filter((m) => !m.archived));
       notify("成功 · 归档已清空", `永久删除了 ${archivedMessages.length} 条归档消息`);
     };
     if (Platform.OS === "web") {
@@ -1080,6 +1085,9 @@ export default function AIScreen() {
               <Text className="text-muted text-xs ml-1">存入自定义</Text>
             </TouchableOpacity>
           )}
+          <TouchableOpacity onPress={() => archiveOneMessage(item.id)} className="ml-3" activeOpacity={0.7}>
+            <Text className="text-muted text-xs">归档</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={() => deleteOneMessage(item.id)} className="ml-3" activeOpacity={0.7}>
             <Text className="text-muted text-xs">删除</Text>
           </TouchableOpacity>
