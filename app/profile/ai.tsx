@@ -11,6 +11,9 @@ import {
   Keyboard,
   Platform,
   Image,
+  Modal,
+  Pressable,
+  ScrollView,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
@@ -124,6 +127,27 @@ type PendingImage = { uri: string; name?: string; mimeType: string };
 // 单张图片上限，超过就提示换小图，避免请求体过大被网关/代理拒掉。
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 
+// RN Web 的 Text 默认不可选，显式打开 user-select 才能长按/拖选。
+const WEB_SELECTABLE = Platform.OS === "web" ? ({ userSelect: "text", cursor: "text" } as any) : undefined;
+
+// Markdown 的每个文字节点都开 selectable：原生长按会弹出系统「复制 / 全选」菜单。
+const SELECTABLE_MARKDOWN_RULES: any = {
+  text: (node: any, _children: any, _parent: any, styles: any, inheritedStyles: any = {}) => (
+    <Text
+      key={node.key}
+      selectable
+      style={[inheritedStyles, styles.text, WEB_SELECTABLE]}
+    >
+      {node.content}
+    </Text>
+  ),
+  textgroup: (node: any, children: any, _parent: any, styles: any) => (
+    <Text key={node.key} selectable style={[styles.textgroup, WEB_SELECTABLE]}>
+      {children}
+    </Text>
+  ),
+};
+
 // 把选图结果统一转成 data URI。真机由 expo-image-picker 直接给 base64；
 // Web 若拿不到 base64，则用 FileReader 从 blob URI 读一份。
 async function toDataUri(asset: {
@@ -192,6 +216,8 @@ export default function AIScreen() {
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [pendingImage, setPendingImage] = useState<PendingImage | null>(null);
+  // 长按气泡进入「选择文字」浮层：里面是纯文本，保证任何平台都能长按拖选片段。
+  const [selectionTarget, setSelectionTarget] = useState<AIMessage | null>(null);
   // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
   const [toolActions, setToolActions] = useState<{ name: string; args: any; result: ToolResult }[]>([]);
 
@@ -737,64 +763,74 @@ export default function AIScreen() {
     const isUser = item.role === "user";
     return (
       <View className={`mb-3 ${isUser ? "items-end" : "items-start"}`}>
-        <View
-          className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-            isUser ? "bg-primary" : "bg-surface border border-border"
-          }`}
-        >
-          {item.image &&
-            (previewUri ? (
-              <Image
-                source={{ uri: previewUri }}
-                style={{ width: 200, height: 150, borderRadius: 10, marginBottom: 8 }}
-                resizeMode="cover"
-              />
+        <Pressable onLongPress={() => setSelectionTarget(item)} delayLongPress={400}>
+          <View
+            style={WEB_SELECTABLE}
+            className={`max-w-[85%] rounded-2xl px-4 py-3 ${
+              isUser ? "bg-primary" : "bg-surface border border-border"
+            }`}
+          >
+            {item.image &&
+              (previewUri ? (
+                <Image
+                  source={{ uri: previewUri }}
+                  style={{ width: 200, height: 150, borderRadius: 10, marginBottom: 8 }}
+                  resizeMode="cover"
+                />
+              ) : (
+                <View className="flex-row items-center mb-2">
+                  <IconSymbol name="photo" size={16} color={isUser ? colors.background : colors.muted} />
+                  <Text className={`text-xs ml-2 ${isUser ? "text-background" : "text-muted"}`} numberOfLines={1}>
+                    {item.image.name || "图片（识别结果已保存）"}
+                  </Text>
+                </View>
+              ))}
+            {isUser ? (
+              <Text selectable style={WEB_SELECTABLE} className="text-background">
+                {item.content}
+              </Text>
             ) : (
-              <View className="flex-row items-center mb-2">
-                <IconSymbol name="photo" size={16} color={isUser ? colors.background : colors.muted} />
-                <Text className={`text-xs ml-2 ${isUser ? "text-background" : "text-muted"}`} numberOfLines={1}>
-                  {item.image.name || "图片（识别结果已保存）"}
+              <Markdown style={markdownStyles} rules={SELECTABLE_MARKDOWN_RULES}>
+                {item.content}
+              </Markdown>
+            )}
+            {item.imageAnalysis ? (
+              <View className={`mt-2 pt-2 border-t ${isUser ? "border-background/30" : "border-border"}`}>
+                <Text className={`text-xs font-semibold mb-1 ${isUser ? "text-background" : "text-muted"}`}>
+                  📷 识别结果（已保存）
+                </Text>
+                <Text
+                  selectable
+                  style={WEB_SELECTABLE}
+                  className={`text-xs leading-5 ${isUser ? "text-background" : "text-foreground"}`}
+                  numberOfLines={6}
+                >
+                  {item.imageAnalysis}
                 </Text>
               </View>
-            ))}
-          {isUser ? (
-            <Text className="text-background">{item.content}</Text>
-          ) : (
-            <Markdown style={markdownStyles}>{item.content}</Markdown>
-          )}
-          {item.imageAnalysis ? (
-            <View className={`mt-2 pt-2 border-t ${isUser ? "border-background/30" : "border-border"}`}>
-              <Text className={`text-xs font-semibold mb-1 ${isUser ? "text-background" : "text-muted"}`}>
-                📷 识别结果（已保存）
-              </Text>
-              <Text
-                className={`text-xs leading-5 ${isUser ? "text-background" : "text-foreground"}`}
-                numberOfLines={6}
-              >
-                {item.imageAnalysis}
-              </Text>
-            </View>
-          ) : null}
-        </View>
+            ) : null}
+          </View>
+        </Pressable>
         <View className="flex-row items-center mt-1 px-2">
           <Text className="text-muted text-xs">
             {new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
           </Text>
+          <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
+            <IconSymbol name="square.on.square" size={13} color={colors.muted} />
+            <Text className="text-muted text-xs ml-1">复制</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => setSelectionTarget(item)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
+            <Text className="text-muted text-xs">选择文字</Text>
+          </TouchableOpacity>
           {item.role === "assistant" && (
-            <>
-              <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
-                <IconSymbol name="square.on.square" size={13} color={colors.muted} />
-                <Text className="text-muted text-xs ml-1">复制</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={() => handleSaveNutritionFromText(item.content)}
-                className="ml-3 flex-row items-center"
-                activeOpacity={0.7}
-              >
-                <IconSymbol name="pencil" size={13} color={colors.muted} />
-                <Text className="text-muted text-xs ml-1">存入自定义</Text>
-              </TouchableOpacity>
-            </>
+            <TouchableOpacity
+              onPress={() => handleSaveNutritionFromText(item.content)}
+              className="ml-3 flex-row items-center"
+              activeOpacity={0.7}
+            >
+              <IconSymbol name="pencil" size={13} color={colors.muted} />
+              <Text className="text-muted text-xs ml-1">存入自定义</Text>
+            </TouchableOpacity>
           )}
         </View>
       </View>
@@ -1211,6 +1247,58 @@ export default function AIScreen() {
           </View>
         </View>
       </KeyboardAvoidingView>
+
+      {/* 长按气泡后的文字选择浮层：纯文本可长按拖选，复制后可直接粘回输入框 */}
+      <Modal
+        visible={!!selectionTarget}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSelectionTarget(null)}
+      >
+        <Pressable
+          style={{ flex: 1, justifyContent: "center", alignItems: "center", backgroundColor: "rgba(0,0,0,0.5)", padding: 20 }}
+          onPress={() => setSelectionTarget(null)}
+        >
+          <Pressable
+            style={{ width: "100%", maxWidth: 520, backgroundColor: colors.background, borderRadius: 16, borderWidth: 1, borderColor: colors.border, padding: 20 }}
+            onPress={() => {}}
+          >
+            <View className="flex-row items-center justify-between mb-3">
+              <Text className="text-foreground font-semibold">选择文字</Text>
+              <TouchableOpacity onPress={() => setSelectionTarget(null)} className="p-1">
+                <IconSymbol name="xmark" size={20} color={colors.muted} />
+              </TouchableOpacity>
+            </View>
+            <Text className="text-muted text-xs mb-3 leading-5">
+              长按下面文字拖选片段，用系统菜单复制；复制后点「粘贴到输入框」即可接着编辑。
+            </Text>
+            <ScrollView style={[{ maxHeight: 300, marginBottom: 16 }, WEB_SELECTABLE]}>
+              <Text selectable style={WEB_SELECTABLE} className="text-foreground text-sm leading-6">
+                {selectionTarget?.content || ""}
+              </Text>
+            </ScrollView>
+            <View className="flex-row gap-2">
+              <TouchableOpacity
+                onPress={() => selectionTarget && handleCopy(selectionTarget.content)}
+                className="flex-1 bg-surface border border-border rounded-xl py-3 items-center"
+                activeOpacity={0.7}
+              >
+                <Text className="text-foreground text-sm">复制全文</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => {
+                  setSelectionTarget(null);
+                  void handlePaste();
+                }}
+                className="flex-1 bg-surface border border-border rounded-xl py-3 items-center"
+                activeOpacity={0.7}
+              >
+                <Text className="text-foreground text-sm">粘贴到输入框</Text>
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </ScreenContainer>
   );
 }
