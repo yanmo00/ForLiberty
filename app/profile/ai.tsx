@@ -311,7 +311,7 @@ export default function AIScreen() {
 
   // 软键盘：KAV 上方固定内容的高度；键盘高度/显隐与其它页面共用同一个 hook
   const [topOffset, setTopOffset] = useState(0);
-  const { height: keyboardHeight, visible: keyboardVisible } = useKeyboardOverlap();
+  const { visible: keyboardVisible, keyboardHeight } = useKeyboardOverlap();
   // 配置面板是页面里唯一需要自己滚动的区域：头部/状态栏/结果条/底部按钮都常驻，
   // 只给表单区一个上限高度，避免内容把聊天区挤没、也避免超出屏幕被裁掉无法下滑。
   const { height: windowHeight } = useWindowDimensions();
@@ -1088,7 +1088,7 @@ export default function AIScreen() {
     );
   };
 
-  // 键盘避让统一交给 ScreenContainer：原生用 KAV 压缩整页，Web 用 paddingBottom。
+  // 键盘避让统一交给 ScreenContainer：Android/Web 用实测覆盖高度补 paddingBottom，iOS 用 KAV。
   // 以前 AI 页自己再套一层 KAV，两层叠加会让输入区算错高度、仍被键盘盖住。
   return (
     <ScreenContainer
