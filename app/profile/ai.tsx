@@ -166,12 +166,14 @@ const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
 const WEB_SELECTABLE = Platform.OS === "web" ? ({ userSelect: "text", cursor: "text" } as any) : undefined;
 
 // Markdown 的每个文字节点都开 selectable：原生长按会弹出系统「复制 / 全选」菜单。
+// style 顺序沿用库默认写法：inheritedStyles（加粗/斜体/链接）必须盖在 styles.text 上，
+// 否则自定义 text rule 会把 Markdown 的行内样式抹掉。
 const SELECTABLE_MARKDOWN_RULES: any = {
   text: (node: any, _children: any, _parent: any, styles: any, inheritedStyles: any = {}) => (
     <Text
       key={node.key}
       selectable
-      style={[inheritedStyles, styles.text, WEB_SELECTABLE]}
+      style={[styles.text, inheritedStyles, WEB_SELECTABLE]}
     >
       {node.content}
     </Text>
