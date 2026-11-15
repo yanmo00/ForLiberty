@@ -162,6 +162,19 @@ function describeReasoningError(msg: string): string | null {
   );
 }
 
+// 判断「整段回复是在拒绝识别图片」，而不是句子里恰好出现否定词。
+// 反例：正常识别结果里常有「因无法直接读取包装背面的营养成分表，故按常见品类估算」，
+// 旧版用 /无法读取/ 直接匹配会把这类有效结果误判成失败，表现就是「时灵时不灵」。
+function isVisionRefusal(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.length > 180) return false;
+  // 只要写了实质内容（食物、热量、数值、清单），就不算拒答
+  if (/图中可见|图片中|识别结果|可记录数据|kcal|热量|蛋白|碳水|脂肪|食物|体重|体脂|动作|组数|\d+\s*g/i.test(t)) return false;
+  return /看不到(这张)?(图片|图)|无法(查看|看到|读取|访问|识别)(这张)?(图片|图)|读不到图片|没有收到图片|未提供图片|不支持图片|无法访问图片|cannot (see|view|access) (the )?image|no image (was )?(provided|received)|unable to (see|view|process) (the )?image/i.test(t);
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // 分诊：以前任何网络失败都甩「浏览器跨域/代理没启动」，真机断网也这么报，纯属误导。
 async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<string> {
   const reasoning = describeReasoningError(msg);
@@ -584,39 +597,74 @@ export default function AIScreen() {
     const configBase = normalizeBaseUrl(baseUrl || state.aiConfig.baseUrl || TOKENHUB_BASE_URL);
     const effectiveKey = apiKey.trim() || state.aiConfig.apiKey || "";
     const target = `${resolveBaseUrl(configBase)}/chat/completions`;
-    const body: Record<string, unknown> = {
-      model: modelOverride || model || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
-      messages,
-      // 2000 对推理型模型不够：thinking 吃满预算后正文为空，上游会抛 502 empty reply。
-      max_tokens: tokenOverride ?? Math.min(32768, Math.max(512, Number(maxTokens) || DEFAULT_MAX_TOKENS)),
-    };
-    // 自建 / agent 类网关常不支持 tools，关掉开关后所有请求都退化成纯对话。
-    if (withTools && toolsEnabled) {
-      body.tools = AI_TOOLS;
-      body.tool_choice = "auto";
-    }
-    const response = await fetchWithRetry(
-      target,
-      withProxyHeadersFor(configBase, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${effectiveKey}`,
-        },
-        body: JSON.stringify(body),
-      })
-    );
-    if (!response.ok) {
-      const resBody = await response.text().catch(() => "");
-      let message: string = resBody;
-      try {
-        message = JSON.parse(resBody)?.error?.message || resBody;
-      } catch {
-        // 纯文本错误
+    const configured = Math.min(32768, Math.max(512, Number(maxTokens) || DEFAULT_MAX_TOKENS));
+    const baseTokens = tokenOverride ?? configured;
+
+    // 空正文 / 502 是推理型模型的偶发瞬时故障（Auto 每次可能路由到不同型号）：
+    // 自动重试，逐次加大输出预算并去掉工具 schema 减轻推理负担。
+    // 401/429/404 这类确定性错误立即抛出，不浪费额度。
+    let lastError: Error | null = null;
+    let reasoningFailure = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const tokens = reasoningFailure
+        ? Math.min(32768, Math.max(baseTokens, 8192 * attempt))
+        : attempt === 0
+          ? baseTokens
+          : Math.min(32768, Math.max(baseTokens, 4096));
+      const useTools = withTools && toolsEnabled && !reasoningFailure;
+      const body: Record<string, unknown> = {
+        model: modelOverride || model || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
+        messages,
+        max_tokens: tokens,
+      };
+      if (useTools) {
+        body.tools = AI_TOOLS;
+        body.tool_choice = "auto";
       }
-      throw new Error(`HTTP ${response.status}：${message || response.statusText}`);
+      const response = await fetchWithRetry(
+        target,
+        withProxyHeadersFor(configBase, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${effectiveKey}`,
+          },
+          body: JSON.stringify(body),
+        })
+      );
+      if (!response.ok) {
+        const resBody = await response.text().catch(() => "");
+        let message: string = resBody;
+        try {
+          message = JSON.parse(resBody)?.error?.message || resBody;
+        } catch {
+          // 纯文本错误
+        }
+        const err = new Error(`HTTP ${response.status}：${message || response.statusText}`);
+        const retryable =
+          !!describeReasoningError(message) ||
+          response.status === 502 || response.status === 503 || response.status === 504;
+        if (retryable && attempt < 2) {
+          reasoningFailure = reasoningFailure || !!describeReasoningError(message);
+          lastError = err;
+          await pause(700 * (attempt + 1));
+          continue;
+        }
+        throw err;
+      }
+      const data = await response.json();
+      const msg = data?.choices?.[0]?.message;
+      const hasTools = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
+      // HTTP 200 但正文为空：同样是推理耗尽，加大预算再试一次
+      if (!String(msg?.content ?? "").trim() && !hasTools && attempt < 2) {
+        reasoningFailure = true;
+        lastError = new Error("模型返回了空正文（推理耗尽）");
+        await pause(700 * (attempt + 1));
+        continue;
+      }
+      return data;
     }
-    return response.json();
+    throw lastError ?? new Error("请求失败：模型连续多次没有返回正文");
   };
 
   // 图片识别：单独一次纯视觉请求（不带工具），拿到的文字作为上下文喂给主对话，
@@ -640,14 +688,15 @@ export default function AIScreen() {
         ],
       },
     ];
-    const data = await callChat(messages, false, vision || undefined);
+    // 识别食物清单输出较长，Auto 又可能路由到推理型型号 → 预算至少 8192。
+    const visionTokens = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
+    const data = await callChat(messages, false, vision || undefined, visionTokens);
     const text = String(data?.choices?.[0]?.message?.content ?? "").trim();
-    if (!text) throw new Error("视觉模型没有返回识别结果（输出预算太小，或模型/网关不支持图片）");
-    // 网关不支持 image_url 时，模型往往只收到文字，会客气地回一句「我看不到图片」。
-    // 旧逻辑把这句当成识别结果存进记录，后续主模型就跟着说「当前环境读不到图片内容」。
-    if (/看不到|看不清|无法查看|无法读取|读不到|没有收到图片|未提供图片|不支持图片|无法访问图片|无法识别图片|cannot (see|view|access)|no image|unable to (see|view|process).*image/i.test(text)) {
+    if (!text) throw new Error("视觉模型没有返回识别结果（连续重试后正文仍为空，可把「最大输出 token」调大再试）");
+    // 只有「整段都在拒绝」才算失败；局部出现「因无法直接读取包装背面…」是正常识别结果。
+    if (isVisionRefusal(text)) {
       throw new Error(
-        `网关或模型没拿到图片：${text.slice(0, 100)}。请到「高级设置 → 视觉模型」填支持视觉的 ID（点「查模型名」找带 vl / vision 的）；自建网关还必须支持 OpenAI 的 image_url 数组格式，否则图片会被丢弃。`
+        `这次没拿到图片内容：${text.slice(0, 100)}。多半是 Auto 路由到了不带视觉能力的型号，直接重发即可；若持续出现，到「高级设置 → 视觉模型」单独指定一个视觉型号。`
       );
     }
     return text;
@@ -692,6 +741,7 @@ export default function AIScreen() {
         ? "\n\n[图片] 本轮消息里已附上「图片识别结果」。把它当作事实上下文来回答；其中若有食物热量、体测数值或训练组次，请调用对应工具保存，并在回复里说明存了什么。"
         : "");
 
+    let executedCount = 0;
     try {
       let contextText = userContent;
 
@@ -701,14 +751,17 @@ export default function AIScreen() {
           analysis = await recognizeImage(image.uri, text);
         } catch (err) {
           const raw = err instanceof Error ? err.message : String(err);
-          const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404/i.test(raw)
-            ? `当前模型可能不支持图片。到「高级设置 → 视觉模型」填一个支持视觉的 ID（点「查模型名」从 /v1/models 找带 vl / vision 的，例如 ${TOKENHUB_VISION_MODEL_EXAMPLE}）再重发。`
+          const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404|图片/i.test(raw)
+            ? `Auto 这次可能路由到了不带视觉能力的型号；文字和图片已放回输入框，直接点发送重发即可。若持续失败，到「高级设置 → 视觉模型」单独指定视觉型号。`
             : await diagnoseNetworkError(raw, baseUrl);
-          notify("失败 · 图片识别未完成", `${raw}\n${hint}`);
-          // 原始错误也写进对话记录：以前只存 hint，模型看不到真实原因，
-          // 只能根据上下文猜「当前环境读不到图片内容」。
-          addAIMessage({ role: "assistant", content: `图片识别失败：${raw}\n${hint}` });
-          return; // 用户图片消息已保存，不会消失；finally 会收尾
+          notify("失败 · 图片识别未完成（可重发）", `${raw}\n${hint}`);
+          // 失败不再往聊天里堆长篇错误：撤掉刚落库的用户消息并恢复输入，
+          // 一次点击即可重发，避免「失败一次多两条记录、翻下来太多」。
+          deleteOneMessage(userMsg.id);
+          messagesRef.current = messagesRef.current.filter((m) => m.id !== userMsg.id);
+          setInputText(text);
+          setPendingImage(image);
+          return;
         }
         // 识别结果写回这条消息 → 随聊天记录持久化/导出，就是「对应数据记录」
         updateAIMessage(userMsg.id, { imageAnalysis: analysis });
@@ -736,19 +789,15 @@ export default function AIScreen() {
       ];
 
       let finalText = "";
-      let executedCount = 0;
       for (let turn = 0; turn < 6; turn++) {
         let data: any;
         try {
           data = await callChat(conversation);
         } catch (err) {
-          // 首轮失败自动降级一次：去掉工具 schema（很多自建网关不支持 tools），
-          // 并把输出预算拉到 8192（推理型模型常把小预算全花在 thinking 上）。
+          // 首轮若因「网关不支持 tools」失败，自动退化成纯对话再试一次。
+          // 推理耗尽 / 502 的重试已在 callChat 内部处理，这里不重复发请求。
           const msg = err instanceof Error ? err.message : String(err);
-          const fallback =
-            turn === 0 &&
-            (/tool|function|not support|unsupported|参数/i.test(msg) || !!describeReasoningError(msg));
-          if (fallback) {
+          if (turn === 0 && /tool|function|not support|unsupported|参数/i.test(msg)) {
             const bigger = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
             data = await callChat(conversation, false, undefined, bigger);
           } else {
@@ -800,10 +849,19 @@ export default function AIScreen() {
         });
       }
     } catch (error) {
-      addAIMessage({
-        role: "assistant",
-        content: `请求失败：${await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", baseUrl)}`,
-      });
+      const detail = await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", baseUrl);
+      // 详细错误只放结果条（可关、可滚），不再写进聊天记录刷屏；
+      // 同时恢复输入并撤掉这条用户消息，点一下发送就能重发。
+      if (executedCount > 0) {
+        // 本轮已经写过数据，自动重发会重复记录，交给用户自己判断。
+        notify("失败 · 部分操作已执行", `${detail}\n\n本轮 AI 已执行 ${executedCount} 次写操作，为避免重复记录，没有自动恢复输入框。`);
+      } else {
+        notify("失败 · 未收到回复（可重发）", detail);
+        deleteOneMessage(userMsg.id);
+        messagesRef.current = messagesRef.current.filter((m) => m.id !== userMsg.id);
+        setInputText(text);
+        if (image) setPendingImage(image);
+      }
     } finally {
       setIsLoading(false);
     }
