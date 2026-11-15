@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect } from "react";
-import { Text, View, TouchableOpacity, TextInput, FlatList, Alert, ScrollView, Modal } from "react-native";
+import { Text, View, TouchableOpacity, TextInput, FlatList, SectionList, Alert, ScrollView, Modal } from "react-native";
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
@@ -98,6 +98,23 @@ export default function NutritionScreen() {
       carbs: todayEntry?.totalCarbs || 0,
       fats: todayEntry?.totalFats || 0,
     };
+  }, [todayEntry]);
+
+  // 当日记录按早/中/晚三段分开，每段带自己的小计。
+  // 加餐和旧数据（没记餐次）单独留一块，避免记录凭空消失。
+  const mealSections = useMemo(() => {
+    const items = todayEntry?.items || [];
+    const build = (title: string, data: NutritionLogItem[]) => ({
+      title,
+      data,
+      totalCalories: Math.round(data.reduce((sum, i) => sum + (Number(i.calories) || 0), 0)),
+    });
+    const sections = (["breakfast", "lunch", "dinner"] as MealType[]).map((m) =>
+      build(MEAL_TYPE_NAMES[m], items.filter((i) => i.mealType === m))
+    );
+    const others = items.filter((i) => !i.mealType || i.mealType === "snack");
+    if (others.length) sections.push(build("加餐 / 未分类", others));
+    return sections;
   }, [todayEntry]);
 
   useEffect(() => {
@@ -724,10 +741,28 @@ export default function NutritionScreen() {
             </View>
           )}
 
-          {/* 记录列表 */}
-          <FlatList
-            data={todayEntry?.items || []}
+          {/* 记录列表：早 / 中 / 晚三段分开，各自带小计 */}
+          <SectionList
+            sections={mealSections}
             keyExtractor={(item) => item.id}
+            stickySectionHeadersEnabled={false}
+            renderSectionHeader={({ section }) => (
+              <View className="px-5 pt-4 pb-2 flex-row items-center justify-between">
+                <View className="flex-row items-center">
+                  <View className="w-1 h-4 rounded-full bg-primary mr-2" />
+                  <Text className="text-foreground font-semibold">{section.title}</Text>
+                  <Text className="text-muted text-xs ml-2">{section.data.length} 项</Text>
+                </View>
+                <Text className="text-primary text-xs font-semibold">{section.totalCalories} kcal</Text>
+              </View>
+            )}
+            renderSectionFooter={({ section }) =>
+              section.data.length === 0 && !isAddingEntry ? (
+                <View className="mx-5 py-3 rounded-xl border border-dashed border-border items-center">
+                  <Text className="text-muted text-xs">暂无记录</Text>
+                </View>
+              ) : null
+            }
             renderItem={({ item }) => (
               <TouchableOpacity
                 onPress={() => {
@@ -745,15 +780,12 @@ export default function NutritionScreen() {
                   setIsAddingEntry(true);
                 }}
                 onLongPress={() => handleDeleteItem(item)}
-                className="px-5 py-3 border-b border-border"
+                className="mx-5 px-3 py-3 mb-2 bg-surface rounded-xl border border-border"
                 activeOpacity={0.7}
               >
                 <View className="flex-row items-center justify-between">
                   <View className="flex-1">
-                    <Text className="text-foreground font-medium">
-                      {item.name}
-                      {item.mealType ? ` · ${MEAL_TYPE_NAMES[item.mealType]}` : ""}
-                    </Text>
+                    <Text className="text-foreground font-medium">{item.name}</Text>
                     <Text className="text-muted text-sm">
                       {item.quantity}{item.unit === "serving" ? "份" : item.unit || "g"} · {item.calories} kcal · 蛋白 {item.protein}g / 碳水 {item.carbs}g / 脂肪 {item.fats}g
                     </Text>
@@ -761,18 +793,10 @@ export default function NutritionScreen() {
                       <Text className="text-muted text-xs mt-1" numberOfLines={1}>{item.notes}</Text>
                     ) : null}
                   </View>
-                  <Text className="text-primary font-semibold">{item.calories}</Text>
+                  <Text className="text-primary font-semibold ml-3">{item.calories}</Text>
                 </View>
               </TouchableOpacity>
             )}
-            ListEmptyComponent={
-              !isAddingEntry ? (
-                <View className="flex-1 items-center justify-center py-10">
-                  <IconSymbol name="fork.knife" size={48} color={colors.muted} />
-                  <Text className="text-muted mt-4">暂无记录</Text>
-                </View>
-              ) : null
-            }
             contentContainerStyle={{ paddingBottom: 100 }}
           />
 
