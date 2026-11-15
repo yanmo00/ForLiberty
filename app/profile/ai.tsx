@@ -17,6 +17,7 @@ import {
 import * as Clipboard from "expo-clipboard";
 import * as ImagePicker from "expo-image-picker";
 import { useRouter } from "expo-router";
+import { SafeAreaView } from "react-native-safe-area-context";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
@@ -248,7 +249,7 @@ export default function AIScreen() {
   const colors = useColors();
   const router = useRouter();
   const app = useApp();
-  const { state, updateAIConfig, addAIMessage, updateAIMessage, clearAIMessages, updateUserProfile } = app;
+  const { state, updateAIConfig, addAIMessage, updateAIMessage, setAIMessages, updateUserProfile } = app;
   const flatListRef = useRef<FlatList>(null);
   // 图片本体只存内存：持久化消息里只放识别文字，避免大 base64 撑爆 AsyncStorage。
   const imagePreviews = useRef<Record<string, string>>({});
@@ -283,6 +284,17 @@ export default function AIScreen() {
   const [selectionTarget, setSelectionTarget] = useState<AIMessage | null>(null);
   // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
   const [toolActions, setToolActions] = useState<{ name: string; args: any; result: ToolResult }[]>([]);
+  // 归档：主列表只显示未归档消息；归档内容仍留在本机，可在归档箱里删除/恢复。
+  const [showArchive, setShowArchive] = useState(false);
+  const [atBottom, setAtBottom] = useState(true);
+  const activeMessages = useMemo(
+    () => state.aiMessages.filter((m) => !m.archived),
+    [state.aiMessages]
+  );
+  const archivedMessages = useMemo(
+    () => state.aiMessages.filter((m) => m.archived),
+    [state.aiMessages]
+  );
 
   // 软键盘：KAV 上方固定内容的高度；键盘高度/显隐与其它页面共用同一个 hook
   const [topOffset, setTopOffset] = useState(0);
@@ -300,7 +312,8 @@ export default function AIScreen() {
   const [proxyAlive, setProxyAlive] = useState<boolean | null>(null);
 
   useEffect(() => {
-    messagesRef.current = state.aiMessages;
+    // 归档的历史不进模型上下文：否则归档只是藏起来，token 还是照烧。
+    messagesRef.current = state.aiMessages.filter((m) => !m.archived);
   }, [state.aiMessages]);
 
   useEffect(() => {
@@ -796,27 +809,67 @@ export default function AIScreen() {
     }
   };
 
-  // 清除对话：Web 没有原生确认弹窗，直接执行并给可见反馈；真机保留确认
+  // 清除当前对话：只清主视图，归档箱里的内容不动（要删去归档箱）。
   const handleClearMessages = () => {
+    const doClear = () => {
+      setAIMessages(archivedMessages);
+      notify("成功 · 已清除", `已清空当前 ${activeMessages.length} 条消息；归档箱里 ${archivedMessages.length} 条未动`);
+    };
     if (Platform.OS === "web") {
-      clearAIMessages();
-      notify("成功 · 已清除", "对话记录已清空");
+      doClear();
       return;
     }
-    Alert.alert("清除对话", "确定要清除所有对话记录吗？", [
+    Alert.alert("清除当前对话", `清空当前 ${activeMessages.length} 条消息？归档箱里的内容不会删除。`, [
       { text: "取消", style: "cancel" },
-      { text: "清除", style: "destructive", onPress: clearAIMessages },
+      { text: "清除", style: "destructive", onPress: doClear },
     ]);
   };
 
-  // 滚动到底部
-  useEffect(() => {
-    if (state.aiMessages.length > 0) {
-      setTimeout(() => {
-        flatListRef.current?.scrollToEnd({ animated: true });
-      }, 100);
+  // 归档当前全部消息：只打标记，不删数据
+  const handleArchiveAll = () => {
+    if (activeMessages.length === 0) return;
+    const ids = new Set(activeMessages.map((m) => m.id));
+    setAIMessages(state.aiMessages.map((m) => (ids.has(m.id) ? { ...m, archived: true } : m)));
+    notify("成功 · 已归档", `${activeMessages.length} 条消息移入归档箱，主列表已清爽`);
+    setAtBottom(true);
+  };
+
+  const deleteOneMessage = (id: string) => {
+    setAIMessages(state.aiMessages.filter((m) => m.id !== id));
+  };
+
+  const restoreOneMessage = (id: string) => {
+    setAIMessages(state.aiMessages.map((m) => (m.id === id ? { ...m, archived: false } : m)));
+    setAtBottom(true);
+  };
+
+  const clearArchive = () => {
+    const doClear = () => {
+      setAIMessages(activeMessages);
+      notify("成功 · 归档已清空", `永久删除了 ${archivedMessages.length} 条归档消息`);
+    };
+    if (Platform.OS === "web") {
+      doClear();
+      return;
     }
-  }, [state.aiMessages.length]);
+    Alert.alert("清空归档箱", `永久删除 ${archivedMessages.length} 条归档消息？不可恢复。`, [
+      { text: "取消", style: "cancel" },
+      { text: "删除", style: "destructive", onPress: doClear },
+    ]);
+  };
+
+  const scrollToBottom = () => {
+    flatListRef.current?.scrollToEnd({ animated: true });
+    setAtBottom(true);
+  };
+
+  // 滚动到底部（新消息 / 归档 / 恢复后）
+  useEffect(() => {
+    if (activeMessages.length > 0) {
+      const timer = setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
+      return () => clearTimeout(timer);
+    }
+  }, [activeMessages.length]);
 
   const markdownStyles = useMemo(() => ({
     body: { color: colors.foreground, fontSize: 15, lineHeight: 22 },
@@ -929,6 +982,9 @@ export default function AIScreen() {
               <Text className="text-muted text-xs ml-1">存入自定义</Text>
             </TouchableOpacity>
           )}
+          <TouchableOpacity onPress={() => deleteOneMessage(item.id)} className="ml-3" activeOpacity={0.7}>
+            <Text className="text-muted text-xs">删除</Text>
+          </TouchableOpacity>
         </View>
       </View>
     );
@@ -958,7 +1014,7 @@ export default function AIScreen() {
           <TouchableOpacity onPress={() => setShowConfig(!showConfig)} className="p-1">
             <IconSymbol name="gearshape.fill" size={22} color={showConfig ? colors.primary : colors.muted} />
           </TouchableOpacity>
-          {state.aiMessages.length > 0 && (
+          {activeMessages.length > 0 && (
             <TouchableOpacity onPress={handleClearMessages} className="p-1">
               <IconSymbol name="trash" size={22} color={colors.muted} />
             </TouchableOpacity>
@@ -997,6 +1053,31 @@ export default function AIScreen() {
           <Text className="text-background text-xs font-medium">
             {isTesting ? "测试中…" : "测试连接"}
           </Text>
+        </TouchableOpacity>
+      </View>
+
+      {/* 消息管理：归档 / 归档箱 / 一键到底。键盘弹起时只留「到底」，给输入区腾空间 */}
+      <View className="flex-row items-center gap-2 px-5 py-2 border-b border-border">
+        {!keyboardVisible && activeMessages.length > 0 && (
+          <TouchableOpacity
+            onPress={handleArchiveAll}
+            className="px-3 py-1.5 rounded-lg bg-surface border border-border"
+            activeOpacity={0.7}
+          >
+            <Text className="text-foreground text-xs">归档当前 {activeMessages.length}</Text>
+          </TouchableOpacity>
+        )}
+        {!keyboardVisible && (
+          <TouchableOpacity
+            onPress={() => setShowArchive(true)}
+            className="px-3 py-1.5 rounded-lg bg-surface border border-border"
+            activeOpacity={0.7}
+          >
+            <Text className="text-foreground text-xs">归档箱 {archivedMessages.length}</Text>
+          </TouchableOpacity>
+        )}
+        <TouchableOpacity onPress={scrollToBottom} className="px-3 py-1.5 rounded-lg bg-primary" activeOpacity={0.7}>
+          <Text className="text-background text-xs">↓ 一键到底</Text>
         </TouchableOpacity>
       </View>
 
@@ -1292,10 +1373,16 @@ export default function AIScreen() {
         {/* 消息列表 */}
         <FlatList
           ref={flatListRef}
-          data={state.aiMessages}
+          data={activeMessages}
           keyExtractor={(item, index) => item.id || `msg_${item.timestamp}_${index}`}
           renderItem={renderMessage}
           contentContainerStyle={{ padding: 20, paddingBottom: 10 }}
+          onScroll={(e) => {
+            const { contentOffset, layoutMeasurement, contentSize } = e.nativeEvent;
+            const distance = contentSize.height - layoutMeasurement.height - contentOffset.y;
+            setAtBottom(distance < 120);
+          }}
+          scrollEventThrottle={150}
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode={Platform.OS === "ios" ? "on-drag" : undefined}
           onContentSizeChange={() => {
@@ -1313,6 +1400,18 @@ export default function AIScreen() {
             </View>
           }
         />
+
+        {/* 往上翻历史时，随时可点回到底部 */}
+        {!atBottom && activeMessages.length > 0 && (
+          <TouchableOpacity
+            onPress={scrollToBottom}
+            activeOpacity={0.8}
+            className="absolute right-4 w-11 h-11 rounded-full bg-primary items-center justify-center"
+            style={{ bottom: 88, zIndex: 20, elevation: 4 }}
+          >
+            <Text className="text-background text-lg">↓</Text>
+          </TouchableOpacity>
+        )}
 
         {/* 加载指示器 */}
         {isLoading && (
@@ -1459,6 +1558,69 @@ export default function AIScreen() {
             </View>
           </Pressable>
         </Pressable>
+      </Modal>
+
+      {/* 归档箱：查看 / 恢复 / 删除单条 / 清空 */}
+      <Modal visible={showArchive} animationType="slide" onRequestClose={() => setShowArchive(false)}>
+        <SafeAreaView style={{ flex: 1, backgroundColor: colors.background }}>
+          <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
+            <Text className="text-foreground text-lg font-semibold">归档箱 · {archivedMessages.length} 条</Text>
+            <TouchableOpacity onPress={() => setShowArchive(false)} className="p-1">
+              <IconSymbol name="xmark" size={20} color={colors.muted} />
+            </TouchableOpacity>
+          </View>
+          <ScrollView className="flex-1 px-5 py-3">
+            {archivedMessages.length === 0 ? (
+              <View className="items-center py-12">
+                <Text className="text-muted text-sm text-center">
+                  归档箱是空的。回主界面点「归档当前」，历史消息就会收进这里。
+                </Text>
+              </View>
+            ) : (
+              archivedMessages.map((m) => (
+                <View key={m.id} className="mb-3 p-3 rounded-xl bg-surface border border-border">
+                  <View className="flex-row items-center justify-between mb-2">
+                    <Text className="text-muted text-xs">
+                      {m.role === "user" ? "我" : "AI"} ·{" "}
+                      {new Date(m.timestamp).toLocaleString("zh-CN", {
+                        month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+                      })}
+                    </Text>
+                    <View className="flex-row gap-3">
+                      <TouchableOpacity onPress={() => restoreOneMessage(m.id)} activeOpacity={0.7}>
+                        <Text className="text-primary text-xs">恢复</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity onPress={() => deleteOneMessage(m.id)} activeOpacity={0.7}>
+                        <Text className="text-error text-xs">删除</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                  <Text selectable className="text-foreground text-xs leading-5" numberOfLines={4}>
+                    {m.content}
+                  </Text>
+                </View>
+              ))
+            )}
+          </ScrollView>
+          {archivedMessages.length > 0 && (
+            <View className="px-5 py-3 border-t border-border flex-row gap-3">
+              <TouchableOpacity
+                onPress={clearArchive}
+                className="flex-1 bg-error/15 border border-error/40 rounded-xl py-3 items-center"
+                activeOpacity={0.7}
+              >
+                <Text className="text-error text-sm font-medium">清空归档箱</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => setShowArchive(false)}
+                className="flex-1 bg-surface border border-border rounded-xl py-3 items-center"
+                activeOpacity={0.7}
+              >
+                <Text className="text-foreground text-sm">返回对话</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </SafeAreaView>
       </Modal>
     </ScreenContainer>
   );

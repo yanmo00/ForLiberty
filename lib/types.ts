@@ -268,6 +268,8 @@ export interface AIMessage {
   image?: AIMessageImage;
   // 图片识别结果：作为上下文参与回复，并随消息持久化/导出备份。
   imageAnalysis?: string;
+  // 归档：主聊天列表只显示未归档消息；归档内容仍保存在本地，可在归档箱里删除/恢复。
+  archived?: boolean;
 }
 
 // 训练目标
