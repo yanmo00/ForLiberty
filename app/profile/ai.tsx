@@ -8,7 +8,6 @@ import {
   Alert,
   ActivityIndicator,
   KeyboardAvoidingView,
-  Keyboard,
   Platform,
   Image,
   Modal,
@@ -21,6 +20,7 @@ import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
+import { useKeyboardOverlap } from "@/hooks/use-keyboard-overlap";
 import { useApp } from "@/lib/app-context";
 import type { AIMessage, AIConfig } from "@/lib/types";
 import Markdown from "react-native-markdown-display";
@@ -221,10 +221,9 @@ export default function AIScreen() {
   // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
   const [toolActions, setToolActions] = useState<{ name: string; args: any; result: ToolResult }[]>([]);
 
-  // 软键盘：KAV 上方固定内容的高度、键盘是否弹起、键盘占掉的高度
+  // 软键盘：KAV 上方固定内容的高度；键盘高度/显隐与其它页面共用同一个 hook
   const [topOffset, setTopOffset] = useState(0);
-  const [keyboardVisible, setKeyboardVisible] = useState(false);
-  const [keyboardHeight, setKeyboardHeight] = useState(0);
+  const { height: keyboardHeight, visible: keyboardVisible } = useKeyboardOverlap();
   // Web 预览时本机代理是否在线：一眼能看出「请求失败」是不是代理没起导致的
   const [proxyAlive, setProxyAlive] = useState<boolean | null>(null);
 
@@ -248,34 +247,12 @@ export default function AIScreen() {
     };
   }, []);
 
+  // 键盘弹出后把最后一条消息滚到可视区，避免被键盘盖住；收起时 KAV / padding 自动复原。
   useEffect(() => {
-    // Web 没有 RN 的 Keyboard 事件，用 visualViewport 判断浏览器虚拟键盘/缩放挤占的高度
-    if (Platform.OS === "web") {
-      const vv = (globalThis as any).visualViewport;
-      if (!vv) return;
-      const onResize = () => {
-        const overlap = Math.max(0, (globalThis as any).innerHeight - vv.height - vv.offsetTop);
-        setKeyboardHeight(overlap > 80 ? overlap : 0);
-        setKeyboardVisible(overlap > 80);
-      };
-      vv.addEventListener?.("resize", onResize);
-      return () => vv.removeEventListener?.("resize", onResize);
-    }
-    const show = Keyboard.addListener("keyboardDidShow", (e) => {
-      setKeyboardHeight(e.endCoordinates.height);
-      setKeyboardVisible(true);
-      // 键盘弹出后把最后一条消息滚到可视区，避免被键盘盖住
-      setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 120);
-    });
-    const hide = Keyboard.addListener("keyboardDidHide", () => {
-      setKeyboardHeight(0);
-      setKeyboardVisible(false);
-    });
-    return () => {
-      show.remove();
-      hide.remove();
-    };
-  }, []);
+    if (!keyboardVisible) return;
+    const timer = setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 120);
+    return () => clearTimeout(timer);
+  }, [keyboardVisible]);
 
   // 选图：只做本地读取，不发请求；发送时才识别
   const handlePickImage = async () => {
@@ -837,8 +814,9 @@ export default function AIScreen() {
     );
   };
 
+  // AI 界面自带只包「消息列表 + 输入区」的 KAV，关掉容器层规避以免叠加
   return (
-    <ScreenContainer edges={["top", "left", "right", "bottom"]} className="flex-1">
+    <ScreenContainer edges={["top", "left", "right", "bottom"]} className="flex-1" keyboardAware={false}>
       {/* KAV 上方的固定内容：量出高度给 iOS 的 keyboardVerticalOffset 用 */}
       <View onLayout={(e) => setTopOffset(e.nativeEvent.layout.height)}>
       {/* 头部 */}
