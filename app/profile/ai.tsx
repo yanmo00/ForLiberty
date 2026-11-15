@@ -669,37 +669,77 @@ export default function AIScreen() {
 
   // 图片识别：单独一次纯视觉请求（不带工具），拿到的文字作为上下文喂给主对话，
   // 同时写回该条用户消息的 imageAnalysis 字段，作为可持久化的「识别数据记录」。
+  //
+  // Auto 会把请求路由到不同型号：偶尔落到纯文本/推理型号时，会回一句「我看不到图片」。
+  // 以前这里直接报错、把消息退回输入框让用户手动重发，表现就是「时灵时不灵」。
+  // 现在自动重试 3 次：逐次把 image_url 提前（部分网关对 content 顺序敏感）、
+  // 强化 system 提示、加大输出预算；只有 3 次都失败才把文字+图片退回。
   const recognizeImage = async (dataUri: string, question: string): Promise<string> => {
-    const vision = (state.aiConfig.visionModel || "").trim();
-    const messages = [
-      {
-        role: "system",
-        content:
-          "你是图片识别助手。用中文客观描述图片内容，只写看得清的内容，不要编造数字。" +
-          "若是食物/餐盘：逐项列出食物、估算份量(g)、热量(kcal)与蛋白/碳水/脂肪(g)。" +
-          "若是体脂秤或体测报告：逐项抄录体重、体脂率、BMI、肌肉量等数值与单位。" +
-          "若是训练计划表：列出动作、组数、次数、重量。最后给一行『可记录数据：…』摘要。",
-      },
-      {
-        role: "user",
-        content: [
-          { type: "text", text: question || "请识别这张图片，并把其中可记录的数据逐项列出来。" },
-          { type: "image_url", image_url: { url: dataUri } },
-        ],
-      },
-    ];
-    // 识别食物清单输出较长，Auto 又可能路由到推理型型号 → 预算至少 8192。
-    const visionTokens = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
-    const data = await callChat(messages, false, vision || undefined, visionTokens);
-    const text = String(data?.choices?.[0]?.message?.content ?? "").trim();
-    if (!text) throw new Error("视觉模型没有返回识别结果（连续重试后正文仍为空，可把「最大输出 token」调大再试）");
-    // 只有「整段都在拒绝」才算失败；局部出现「因无法直接读取包装背面…」是正常识别结果。
-    if (isVisionRefusal(text)) {
-      throw new Error(
-        `这次没拿到图片内容：${text.slice(0, 100)}。多半是 Auto 路由到了不带视觉能力的型号，直接重发即可；若持续出现，到「高级设置 → 视觉模型」单独指定一个视觉型号。`
-      );
+    // 与 callChat 保持一致：用配置面板当前值，刚填了视觉模型没点保存也能生效。
+    const vision = (visionModel.trim() || state.aiConfig.visionModel || "").trim();
+    // 识别食物清单输出较长，Auto 又可能路由到推理型型号 → 预算至少 8192，逐次递增。
+    const baseTokens = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
+    const systemBase =
+      "你是图片识别助手。用中文客观描述图片内容，只写看得清的内容，不要编造数字。" +
+      "若是食物/餐盘：逐项列出食物、估算份量(g)、热量(kcal)与蛋白/碳水/脂肪(g)。" +
+      "若是体脂秤或体测报告：逐项抄录体重、体脂率、BMI、肌肉量等数值与单位。" +
+      "若是训练计划表：列出动作、组数、次数、重量。最后给一行『可记录数据：…』摘要。";
+    let lastReason = "视觉模型没有返回识别结果";
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const imagePart = { type: "image_url", image_url: { url: dataUri } };
+      const textPart = {
+        type: "text",
+        text: question || "请识别这张图片，并把其中可记录的数据逐项列出来。",
+      };
+      const messages = [
+        {
+          role: "system",
+          content:
+            systemBase +
+            (attempt > 0
+              ? "\n补充：图片数据已随本条消息一起发送，必须直接基于图片内容作答；禁止回答『看不到图片/无法读取图片』，不要复述任何能力限制。"
+              : ""),
+        },
+        // 第二次起图片放前面：有些网关只解析第一个 content part。
+        { role: "user", content: attempt > 0 ? [imagePart, textPart] : [textPart, imagePart] },
+      ];
+
+      let data: any;
+      try {
+        data = await callChat(
+          messages,
+          false,
+          vision || undefined,
+          Math.min(32768, baseTokens + attempt * 4096)
+        );
+      } catch (err) {
+        lastReason = err instanceof Error ? err.message : String(err);
+        if (attempt < 2) {
+          await pause(600 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`图片识别连续失败：${lastReason}`);
+      }
+
+      const text = String(data?.choices?.[0]?.message?.content ?? "").trim();
+      // 空正文说明推理耗尽：callChat 内部已经为此重试过 3 次，外层不再重复烧额度。
+      if (!text) {
+        throw new Error("视觉模型连续多次没有返回正文（推理耗尽）。把「最大输出 token」调到 16384，或换非推理型视觉模型再试。");
+      }
+      // 只有「整段都在拒绝」才算失败；局部出现「因无法直接读取包装背面…」是正常识别结果。
+      if (!isVisionRefusal(text)) return text;
+
+      lastReason = `这次没拿到图片内容：${text.slice(0, 100)}`;
+      if (attempt < 2) {
+        await pause(600 * (attempt + 1));
+        continue;
+      }
     }
-    return text;
+
+    throw new Error(
+      `${lastReason}。Auto 连续 3 次路由到了不带视觉能力的型号；到「高级设置 → 视觉模型」单独指定一个视觉型号最稳，或直接点发送重发。`
+    );
   };
 
   // 发送消息（支持图片识别 + 工具循环：模型可多次调用工具直到达成目标）
