@@ -51,19 +51,51 @@ const PROVIDERS: { value: AIProvider; label: string; defaultUrl: string; default
   { value: "custom", label: "自定义", defaultUrl: "", defaultModel: "" },
 ];
 
-// 浏览器有同源策略，网关又不给 CORS 头 → Web 走本机代理，真机直连
+// Web 预览一律走本机代理：官方网关不给 CORS 头，自建 / EasyTier 地址多数也不处理
+// OPTIONS 预检，浏览器里带 Authorization 的跨域 POST 都会被拦。真机直连用户填的地址。
+const PROXY_UPSTREAM_HEADER = "X-FitLife-Upstream";
+
+function pageHostname(): string {
+  // 手机用局域网 IP 打开预览时也能连回电脑的代理；本机预览即 localhost。
+  return typeof window !== "undefined" && window.location?.hostname
+    ? window.location.hostname
+    : "127.0.0.1";
+}
+
+function proxyBaseUrl(): string {
+  return TOKENHUB_WEB_PROXY_URL.replace("127.0.0.1", pageHostname());
+}
+
 function resolveBaseUrl(url: string): string {
   const base = normalizeBaseUrl(url);
-  if (Platform.OS !== "web" || base !== TOKENHUB_BASE_URL) return base;
-  // 用页面所在主机拼代理地址：手机用局域网 IP 打开预览时也能连回电脑的代理。
-  // 本机预览时 hostname 是 localhost，行为与写死 127.0.0.1 一致。
-  const hostname =
-    typeof window !== "undefined" && window.location?.hostname ? window.location.hostname : "127.0.0.1";
-  return TOKENHUB_WEB_PROXY_URL.replace("127.0.0.1", hostname);
+  if (Platform.OS !== "web") return base;
+  return proxyBaseUrl();
 }
 
 // 代理的健康检查地址（/__health 在代理根路径，不在 /v1 下）
-const PROXY_HEALTH_URL = TOKENHUB_WEB_PROXY_URL.replace(/\/v1\/?$/, "") + "/__health";
+function proxyHealthUrl(): string {
+  return proxyBaseUrl().replace(/\/v1\/?$/, "") + "/__health";
+}
+
+// 自定义地址把完整 base（含 /v1 前缀）交给代理转发；官方网关走代理的默认上游，不用带头。
+function withProxyHeadersFor(baseUrl: string, init: RequestInit): RequestInit {
+  const base = normalizeBaseUrl(baseUrl);
+  if (Platform.OS !== "web" || !base || base === TOKENHUB_BASE_URL) return init;
+  return {
+    ...init,
+    headers: {
+      ...(init.headers as Record<string, string> | undefined),
+      [PROXY_UPSTREAM_HEADER]: base,
+    },
+  };
+}
+
+function describeCustomEndpoint(baseUrl?: string): string {
+  const base = normalizeBaseUrl(baseUrl || "");
+  if (!base || base === TOKENHUB_BASE_URL) return "";
+  const host = base.replace(/^https?:\/\//, "").split("/")[0];
+  return `\n\n自建 / 局域网地址排查：\n1) 手机必须和运行服务的机器在同一个 EasyTier 虚拟网里，电脑能 ping 通 ${host} 才算通；\n2) 服务端要监听 0.0.0.0（不是 127.0.0.1），并确认 ${base}/chat/completions 存在；\n3) http:// 明文地址在 Android release 包里默认被系统禁止，需安装带明文许可的新 APK；\n4) Web 预览已自动走本机代理绕开跨域，无需在服务端配 CORS。`;
+}
 
 function describeFailure(status: number, body: string): string {
   const lower = body.toLowerCase();
@@ -71,7 +103,9 @@ function describeFailure(status: number, body: string): string {
     return "Key 无效或没权限。到控制台「个人中心 → 账户管理 → 密钥管理」重新复制，别带空格/换行。";
   if (status === 429)
     return "额度用尽或触发限流。到「财务管理 → 费用中心」看余额。";
-  if (status === 404 || lower.includes("model"))
+  if (status === 404)
+    return "404：接口路径或模型名不对。自建/EasyTier 网关确认地址末尾带 /v1、服务确实提供 /v1/chat/completions；官方网关点「查模型名」拿真实 ID。";
+  if (lower.includes("model"))
     return "模型名不对（教程里的 qwen3.7-max 只是图例）。点「查模型名」拿真实 ID 填进高级设置。";
   return `HTTP ${status}：${body.slice(0, 160)}`;
 }
@@ -82,7 +116,7 @@ async function pingProxy(): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 1500);
   try {
-    await fetch(PROXY_HEALTH_URL, { mode: "no-cors", signal: controller.signal });
+    await fetch(proxyHealthUrl(), { mode: "no-cors", signal: controller.signal });
     return true;
   } catch {
     return false;
@@ -106,20 +140,21 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 1): Prom
 }
 
 // 分诊：以前任何网络失败都甩「浏览器跨域/代理没启动」，真机断网也这么报，纯属误导。
-async function diagnoseNetworkError(msg: string): Promise<string> {
-  const networkish = /failed to fetch|network request failed|load failed|networkerror|timeout|aborted|network/i.test(msg);
+async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<string> {
+  const hint = describeCustomEndpoint(baseUrl);
+  const networkish = /failed to fetch|network request failed|load failed|networkerror|timeout|aborted|network|cleartext/i.test(msg);
   if (Platform.OS !== "web") {
     return networkish
-      ? "手机连不上网关：检查联网后重试；真机直连官方域名，不需要启动本机代理。持续失败就点「测试连接」看状态码。"
-      : `连接错误：${msg}`;
+      ? `手机连不上网关：检查联网后重试；真机直连你在高级设置里填的地址，不需要本机代理。若地址是 http://，多半是 Android 禁止明文流量（需重装带明文许可的新 APK）。${hint}`
+      : `连接错误：${msg}${hint}`;
   }
   const alive = await pingProxy();
   if (!alive) {
-    return "本机代理没启动（或已退出 / 8082 被占用）。关掉预览，重新运行 npm run dev:web 一次启动代理+预览；只用 npx expo start --web 不会有代理。";
+    return `本机代理没启动（或已退出 / 8082 被占用）。关掉预览，重新运行 npm run dev:web 一次启动代理+预览；只用 npx expo start --web 不会有代理。${hint}`;
   }
   return networkish
-    ? "本机代理在线，但这次请求仍失败：多为网关偶发超时或断网（已自动重试一次）。可点「测试连接」看具体状态码；若用局域网 IP 打开预览，改用 http://localhost:8081。"
-    : `连接错误：${msg}`;
+    ? `本机代理在线，但这次请求仍失败：多为上游不通、网关超时或断网（已自动重试一次）。点「测试连接」看具体状态码；自定义地址也会经代理转发，请确认上游服务可达。${hint}`
+    : `连接错误：${msg}${hint}`;
 }
 
 // 待发送的图片：uri 是 data URI（base64），只放内存，不写进持久化消息。
@@ -344,14 +379,16 @@ export default function AIScreen() {
     }
   };
 
-  // 当provider变化时更新默认值
-  useEffect(() => {
-    const providerConfig = PROVIDERS.find(p => p.value === provider);
-    if (providerConfig && provider !== "custom") {
-      setBaseUrl(providerConfig.defaultUrl);
-      setModel(providerConfig.defaultModel);
+  // 切换服务商时填入该服务商的默认值。
+  // 注意：以前放在 useEffect([provider]) 里，页面一挂载就会把用户保存的自定义 Base URL
+  // 覆盖回官方地址，导致 EasyTier / 自建地址「保存了却连不上」。改成只在点击时重置。
+  const handleSelectProvider = (p: (typeof PROVIDERS)[number]) => {
+    setProvider(p.value);
+    if (p.value !== "custom") {
+      setBaseUrl(p.defaultUrl);
+      setModel(p.defaultModel);
     }
-  }, [provider]);
+  };
 
   const generateSystemPrompt = () => buildSystemPrompt(buildAISnapshot(state));
 
@@ -370,18 +407,21 @@ export default function AIScreen() {
     setIsTesting(true);
     setNotice(null);
     try {
-      const response = await fetchWithRetry(target, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${effectiveKey}`,
-        },
-        body: JSON.stringify({
-          model: usedModel,
-          messages: [{ role: "user", content: "只回复两个字：收到" }],
-          max_tokens: 10,
-        }),
-      });
+      const response = await fetchWithRetry(
+        target,
+        withProxyHeadersFor(baseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${effectiveKey}`,
+          },
+          body: JSON.stringify({
+            model: usedModel,
+            messages: [{ role: "user", content: "只回复两个字：收到" }],
+            max_tokens: 10,
+          }),
+        })
+      );
       const elapsed = ((Date.now() - started) / 1000).toFixed(1);
       // 网关 401/429 返回 text/plain，json() 会失败，先按纯文本读
       const body = await response.text().catch(() => "");
@@ -401,6 +441,7 @@ export default function AIScreen() {
           [
             `HTTP ${response.status} · 耗时 ${elapsed}s`,
             `请求地址：${target}`,
+            `上游配置：${normalizeBaseUrl(baseUrl)}${Platform.OS === "web" ? "（经本机代理转发）" : "（直连）"}`,
             `模型：${servedModel || usedModel}`,
             reply ? `模型回复：${reply.slice(0, 60)}` : "已收到模型响应",
           ].join("\n")
@@ -414,11 +455,11 @@ export default function AIScreen() {
         }
         notify(
           "失败 · 测试连接未通过",
-          `HTTP ${response.status} · 耗时 ${elapsed}s · 模型 ${usedModel}\n${describeFailure(response.status, message || response.statusText)}`
+          `HTTP ${response.status} · 耗时 ${elapsed}s · 模型 ${usedModel}\n请求地址：${target}\n上游配置：${normalizeBaseUrl(baseUrl)}\n${describeFailure(response.status, message || response.statusText)}${describeCustomEndpoint(baseUrl)}`
         );
       }
     } catch (error) {
-      notify("错误 · 测试连接未通过", await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误"));
+      notify("错误 · 测试连接未通过", await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", baseUrl));
     } finally {
       setIsTesting(false);
     }
@@ -432,12 +473,15 @@ export default function AIScreen() {
       return;
     }
     try {
-      const response = await fetchWithRetry(`${resolveBaseUrl(baseUrl)}/models`, {
-        headers: { "Authorization": `Bearer ${effectiveKey}` },
-      });
+      const response = await fetchWithRetry(
+        `${resolveBaseUrl(baseUrl)}/models`,
+        withProxyHeadersFor(baseUrl, {
+          headers: { "Authorization": `Bearer ${effectiveKey}` },
+        })
+      );
       const body = await response.text().catch(() => "");
       if (!response.ok) {
-        notify("失败", describeFailure(response.status, body));
+        notify("失败", `${describeFailure(response.status, body)}${describeCustomEndpoint(baseUrl)}`);
         return;
       }
       const ids: string[] = (JSON.parse(body)?.data ?? []).map((m: { id?: string }) => m.id || "").filter(Boolean);
@@ -447,7 +491,7 @@ export default function AIScreen() {
       }
       setModelList(ids.slice(0, 20));
     } catch (error) {
-      notify("错误", await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误"));
+      notify("错误", await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", baseUrl));
     }
   };
 
@@ -478,9 +522,13 @@ export default function AIScreen() {
 
   // 调用聊天补全（带工具）；返回解析后的响应 JSON。withTools=false 时退化为纯对话。
   const callChat = async (messages: any[], withTools = true, modelOverride?: string): Promise<any> => {
-    const target = `${resolveBaseUrl(state.aiConfig.baseUrl || TOKENHUB_BASE_URL)}/chat/completions`;
+    // 统一取「配置面板当前值」：以前测试连接用输入框、发消息用已保存值，
+    // 用户刚改了自建地址没点保存时就会出现「测试通过、对话却连旧地址」的假象。
+    const configBase = normalizeBaseUrl(baseUrl || state.aiConfig.baseUrl || TOKENHUB_BASE_URL);
+    const effectiveKey = apiKey.trim() || state.aiConfig.apiKey || "";
+    const target = `${resolveBaseUrl(configBase)}/chat/completions`;
     const body: Record<string, unknown> = {
-      model: modelOverride || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
+      model: modelOverride || model || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
       messages,
       max_tokens: 2000,
     };
@@ -488,14 +536,17 @@ export default function AIScreen() {
       body.tools = AI_TOOLS;
       body.tool_choice = "auto";
     }
-    const response = await fetchWithRetry(target, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${state.aiConfig.apiKey || ""}`,
-      },
-      body: JSON.stringify(body),
-    });
+    const response = await fetchWithRetry(
+      target,
+      withProxyHeadersFor(configBase, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${effectiveKey}`,
+        },
+        body: JSON.stringify(body),
+      })
+    );
     if (!response.ok) {
       const resBody = await response.text().catch(() => "");
       let message: string = resBody;
@@ -586,7 +637,7 @@ export default function AIScreen() {
           const raw = err instanceof Error ? err.message : String(err);
           const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404/i.test(raw)
             ? `当前模型可能不支持图片。到「高级设置 → 视觉模型」填一个支持视觉的 ID（点「查模型名」从 /v1/models 找带 vl / vision 的，例如 ${TOKENHUB_VISION_MODEL_EXAMPLE}）再重发。`
-            : await diagnoseNetworkError(raw);
+            : await diagnoseNetworkError(raw, baseUrl);
           notify("失败 · 图片识别未完成", `${raw}\n${hint}`);
           addAIMessage({ role: "assistant", content: `图片识别失败：${hint}` });
           return; // 用户图片消息已保存，不会消失；finally 会收尾
@@ -670,7 +721,7 @@ export default function AIScreen() {
     } catch (error) {
       addAIMessage({
         role: "assistant",
-        content: `请求失败：${await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误")}`,
+        content: `请求失败：${await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", baseUrl)}`,
       });
     } finally {
       setIsLoading(false);
@@ -955,7 +1006,7 @@ export default function AIScreen() {
               {PROVIDERS.map((p) => (
                 <TouchableOpacity
                   key={p.value}
-                  onPress={() => setProvider(p.value)}
+                  onPress={() => handleSelectProvider(p)}
                   className={`px-4 py-2 rounded-lg ${
                     provider === p.value ? "bg-primary" : "bg-background border border-border"
                   }`}
@@ -981,6 +1032,10 @@ export default function AIScreen() {
               autoCapitalize="none"
               autoCorrect={false}
             />
+            <Text className="text-muted text-xs mt-2 leading-5">
+              自建 / EasyTier 网关：选「自定义」后填完整地址，例如 http://10.126.126.1:3425/v1（末尾要带 /v1），再粘贴 Key 并点「保存配置」。
+              {"\n"}Web 预览会自动经本机代理转发，不需要服务端配 CORS；手机 App 直连，需手机在同一 EasyTier 虚拟网内，且 http:// 明文地址要装带明文许可的新 APK。
+            </Text>
           </View>
 
             </>

@@ -66,6 +66,8 @@ const config: ExpoConfig = {
     favicon: "./assets/images/favicon.png",
   },
   plugins: [
+    // 允许 http:// 自建/局域网/EasyTier 网关（Android release 默认禁明文）
+    "./plugins/with-cleartext-traffic",
     "expo-router",
     [
       "expo-image-picker",
