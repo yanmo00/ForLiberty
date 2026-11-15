@@ -207,7 +207,7 @@ export default function ProfileScreen() {
 
         {/* 版本信息 */}
         <View className="px-5 mt-8 items-center">
-          <Text className="text-muted text-sm">FitLife v2.0.0 · 何浩天 / Neal</Text>
+          <Text className="text-muted text-sm">FitLife v2.0.0 · 云默</Text>
         </View>
       </ScrollView>
     </ScreenContainer>

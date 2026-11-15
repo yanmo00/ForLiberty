@@ -2,6 +2,8 @@
 
 > 训练 + 饮食 + AI 教练，一个就够了。
 
+**作者：云默**
+
 **FitLife** 是一个面向健身爱好者的 Android 应用。不搞花哨的社交功能，专注做好三件事：**记录训练、跟踪饮食、AI 给建议**。够用、清晰、可持续。
 
 ---
@@ -136,25 +138,20 @@
 
 ### 安装 APK
 
-直接下载：
-
-[APK 下载链接](https://expo.dev/accounts/nealtts/projects/health-training-app/builds)
+用 Android Studio / Gradle 本地构建，不消耗 EAS 云构建额度：先 `expo prebuild -p android` 生成 `android/`，再执行 `android/gradlew.bat assembleRelease`，产物在 `android/app/build/outputs/apk/release/app-release.apk`。
 
 ### 本地开发
 
 ```bash
 # 克隆
-git clone https://github.com/tianhhe/FitLife.git
-cd FitLife
+git clone https://github.com/yanmo00/ForLiberty.git
+cd fitlife-demo
 
 # 安装依赖
-pnpm install
+npm install
 
-# 启动开发服务器（Metro + 后端）
-pnpm dev
-
-# 或只启动移动端
-pnpm dev:metro
+# Web 预览：一次启动本机代理 18082 + 预览 8081
+npm run dev:web
 ```
 
 ---

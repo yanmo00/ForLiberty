@@ -290,7 +290,7 @@ export default function SettingsScreen() {
             </View>
             <View className="flex-row items-center justify-between p-4">
               <Text className="text-foreground">开发者</Text>
-              <Text className="text-muted">何浩天 / Neal</Text>
+              <Text className="text-muted">云默</Text>
             </View>
           </View>
         </View>
