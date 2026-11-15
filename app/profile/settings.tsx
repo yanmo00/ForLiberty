@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Text, View, TouchableOpacity, TextInput, ScrollView, Alert } from "react-native";
 import { useRouter } from "expo-router";
+import Constants from "expo-constants";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
@@ -286,7 +287,7 @@ export default function SettingsScreen() {
           <View className="bg-surface rounded-xl border border-border overflow-hidden">
             <View className="flex-row items-center justify-between p-4 border-b border-border">
               <Text className="text-foreground">版本</Text>
-              <Text className="text-muted">1.0.0</Text>
+              <Text className="text-muted">{Constants.expoConfig?.version ?? "2.0.8"}</Text>
             </View>
             <View className="flex-row items-center justify-between p-4">
               <Text className="text-foreground">开发者</Text>

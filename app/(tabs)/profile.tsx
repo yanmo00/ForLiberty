@@ -1,5 +1,6 @@
 import { ScrollView, Text, View, TouchableOpacity, ActivityIndicator, Alert } from "react-native";
 import { useRouter } from "expo-router";
+import Constants from "expo-constants";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
 import { useColors } from "@/hooks/use-colors";
@@ -207,7 +208,7 @@ export default function ProfileScreen() {
 
         {/* 版本信息 */}
         <View className="px-5 mt-8 items-center">
-          <Text className="text-muted text-sm">FitLife v2.0.0 · 云默</Text>
+          <Text className="text-muted text-sm">FitLife v{Constants.expoConfig?.version ?? "2.0.8"} · 云默</Text>
         </View>
       </ScrollView>
     </ScreenContainer>
