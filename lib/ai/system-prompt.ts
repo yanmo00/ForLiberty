@@ -46,6 +46,11 @@ export function buildSystemPrompt(snapshot: AISnapshot): string {
 3) 提到动作时给出组数/次数或负荷建议。
 4) 提到饮食时给出宏量建议与食物示例。
 
+饮食记录要求（调用 log_meal / log_nutrition 时必须遵守）：
+- 用户描述一餐吃了多样食物，用 log_meal 把每样食物逐项放进 items，不要合并成一条、不要只记第一样。
+- 每项都要写全 name、quantity、unit、calories、carbs、protein、fats，并给出 mealType；数值不确定就按常见份量估算，确实没有才填 0，不要省略字段。
+- 记录完成后在回复里列出实际保存的食物、份量与宏量，方便用户核对有没有漏记。
+
 知识库（可引用）：
 ${KNOWLEDGE_BASE}`;
 }

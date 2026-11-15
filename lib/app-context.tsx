@@ -45,6 +45,8 @@ import {
   getTodayString,
   getCurrentTimeString,
 } from './storage';
+import { getAllFoods } from './nutrition-engine';
+import { normalizeNutritionLogInput } from './nutrition-log';
 
 // 状态类型
 interface AppState {
@@ -421,6 +423,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // state.aiMessages 拼数组再写，一轮对话里「用户消息」和「AI 回复」两次写会互相覆盖，
   // 导致用户消息在持久化里丢失（重进页面就消失）。改成单一写入点后彻底消除竞态。
   const saveChainRef = useRef<Promise<void>>(Promise.resolve());
+  // 饮食记录的最新镜像 + 串行落盘链。
+  // 以前 addNutritionEntry 直接读闭包里的 state.nutritionEntries 再整份写回磁盘，
+  // AI 一轮里连续记录多份食物时每次都基于同一份旧快照 → 后写覆盖前写，只剩一条记录。
+  // 改成「先刷新镜像、再按调用顺序串行写盘」后，同轮多次写入会逐条累加。
+  const nutritionEntriesRef = useRef<NutritionEntry[]>(state.nutritionEntries);
+  const customFoodsRef = useRef<FoodLibraryItem[]>(state.customFoods);
+  const nutritionSaveChainRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     if (state.isLoading) return;
@@ -481,6 +490,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
             currentSession,
           },
         });
+        // 磁盘数据加载完后同步镜像，之后的写操作都以镜像为基准。
+        nutritionEntriesRef.current = nutritionEntries;
+        customFoodsRef.current = customFoods;
       } catch (error) {
         console.error('Error loading data:', error);
         dispatch({ type: 'SET_LOADING', payload: false });
@@ -588,22 +600,57 @@ export function AppProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'DELETE_SET_FROM_SESSION', payload: id });
   }, []);
 
+  // 饮食记录的唯一写入点：先刷新内存镜像，再更新 UI，最后按调用顺序串行写盘。
+  const persistNutritionEntries = useCallback(
+    (
+      next: NutritionEntry[],
+      action:
+        | { type: 'UPDATE_NUTRITION_ENTRY'; payload: NutritionEntry }
+        | { type: 'ADD_NUTRITION_ENTRY'; payload: NutritionEntry }
+        | { type: 'DELETE_NUTRITION_ENTRY'; payload: string }
+    ): Promise<void> => {
+      nutritionEntriesRef.current = next;
+      dispatch(action);
+      nutritionSaveChainRef.current = nutritionSaveChainRef.current
+        .then(() => saveNutritionEntries(next))
+        .catch((error) => {
+          console.error('Error saving nutrition entries:', error);
+        });
+      return nutritionSaveChainRef.current;
+    },
+    []
+  );
+
   const addNutritionEntry = useCallback(async (entry: NutritionLogInput): Promise<NutritionEntry> => {
+    // 所有入口统一补全字段：AI 只给食物名/热量时，按食物库折算宏量，
+    // 并补齐 foodId、source、餐次、份量单位，避免落库出现一堆 0 或空字段。
+    const normalized = normalizeNutritionLogInput(
+      {
+        date: entry.date,
+        name: entry.name,
+        foodId: entry.foodId,
+        quantity: entry.quantity,
+        unit: entry.unit,
+        calories: entry.calories,
+        carbs: entry.carbs,
+        protein: entry.protein,
+        fats: entry.fats,
+        source: entry.source,
+        mealType: entry.mealType,
+        notes: entry.notes,
+      },
+      [...getAllFoods(), ...customFoodsRef.current]
+    );
+    if (!normalized) throw new Error('饮食记录缺少食物名称');
+
     const item: NutritionLogItem = {
+      ...normalized.item,
       id: generateId(),
-      foodId: entry.foodId,
-      name: entry.name,
-      quantity: entry.quantity,
-      unit: entry.unit,
-      calories: entry.calories,
-      carbs: entry.carbs,
-      protein: entry.protein,
-      fats: entry.fats,
-      source: entry.source,
       loggedAt: new Date().toISOString(),
     };
-
-    const existing = state.nutritionEntries.find((e) => e.date === entry.date);
+    const date = normalized.date;
+    const current = nutritionEntriesRef.current;
+    const existing = current.find((e) => e.date === date);
     const updatedEntry: NutritionEntry = existing
       ? {
           ...existing,
@@ -615,7 +662,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }
       : {
           id: generateId(),
-          date: entry.date,
+          date,
           items: [item],
           totalCalories: item.calories,
           totalCarbs: item.carbs,
@@ -623,20 +670,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
           totalFats: item.fats,
         };
 
-    if (existing) {
-      dispatch({ type: 'UPDATE_NUTRITION_ENTRY', payload: updatedEntry });
-      await saveNutritionEntries(
-        state.nutritionEntries.map((e) => (e.date === entry.date ? updatedEntry : e))
-      );
-    } else {
-      dispatch({ type: 'ADD_NUTRITION_ENTRY', payload: updatedEntry });
-      await saveNutritionEntries([...state.nutritionEntries, updatedEntry]);
-    }
+    await persistNutritionEntries(
+      existing
+        ? current.map((e) => (e.date === date ? updatedEntry : e))
+        : [...current, updatedEntry],
+      existing
+        ? { type: 'UPDATE_NUTRITION_ENTRY', payload: updatedEntry }
+        : { type: 'ADD_NUTRITION_ENTRY', payload: updatedEntry }
+    );
     return updatedEntry;
-  }, [state.nutritionEntries]);
+  }, [persistNutritionEntries]);
 
   const updateNutritionEntry = useCallback(async (date: string, item: NutritionLogItem) => {
-    const existing = state.nutritionEntries.find((e) => e.date === date);
+    const current = nutritionEntriesRef.current;
+    const existing = current.find((e) => e.date === date);
     if (!existing) return;
 
     const updatedItems = existing.items.map((i) => (i.id === item.id ? item : i));
@@ -659,20 +706,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
       totalFats: totals.fats,
     };
 
-    dispatch({ type: 'UPDATE_NUTRITION_ENTRY', payload: updatedEntry });
-    await saveNutritionEntries(
-      state.nutritionEntries.map((e) => (e.date === date ? updatedEntry : e))
+    await persistNutritionEntries(
+      current.map((e) => (e.date === date ? updatedEntry : e)),
+      { type: 'UPDATE_NUTRITION_ENTRY', payload: updatedEntry }
     );
-  }, [state.nutritionEntries]);
+  }, [persistNutritionEntries]);
 
   const deleteNutritionEntry = useCallback(async (date: string, id: string) => {
-    const existing = state.nutritionEntries.find((e) => e.date === date);
+    const current = nutritionEntriesRef.current;
+    const existing = current.find((e) => e.date === date);
     if (!existing) return;
 
     const updatedItems = existing.items.filter((item) => item.id !== id);
     if (updatedItems.length === 0) {
-      dispatch({ type: 'DELETE_NUTRITION_ENTRY', payload: existing.id });
-      await saveNutritionEntries(state.nutritionEntries.filter((e) => e.date !== date));
+      await persistNutritionEntries(
+        current.filter((e) => e.date !== date),
+        { type: 'DELETE_NUTRITION_ENTRY', payload: existing.id }
+      );
       return;
     }
 
@@ -695,28 +745,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
       totalFats: totals.fats,
     };
 
-    dispatch({ type: 'UPDATE_NUTRITION_ENTRY', payload: updatedEntry });
-    await saveNutritionEntries(
-      state.nutritionEntries.map((e) => (e.date === date ? updatedEntry : e))
+    await persistNutritionEntries(
+      current.map((e) => (e.date === date ? updatedEntry : e)),
+      { type: 'UPDATE_NUTRITION_ENTRY', payload: updatedEntry }
     );
-  }, [state.nutritionEntries]);
+  }, [persistNutritionEntries]);
 
   const addCustomFood = useCallback(async (food: Omit<FoodLibraryItem, 'id'>): Promise<FoodLibraryItem> => {
     const newFood: FoodLibraryItem = { ...food, id: generateId(), isCustom: true };
+    const next = [...customFoodsRef.current, newFood];
+    customFoodsRef.current = next;
     dispatch({ type: 'ADD_CUSTOM_FOOD', payload: newFood });
-    await saveCustomFoods([...state.customFoods, newFood]);
+    await saveCustomFoods(next);
     return newFood;
-  }, [state.customFoods]);
+  }, []);
 
   const updateCustomFood = useCallback(async (food: FoodLibraryItem) => {
+    const next = customFoodsRef.current.map((f) => (f.id === food.id ? food : f));
+    customFoodsRef.current = next;
     dispatch({ type: 'UPDATE_CUSTOM_FOOD', payload: food });
-    await saveCustomFoods(state.customFoods.map((f) => (f.id === food.id ? food : f)));
-  }, [state.customFoods]);
+    await saveCustomFoods(next);
+  }, []);
 
   const deleteCustomFood = useCallback(async (id: string) => {
+    const next = customFoodsRef.current.filter((f) => f.id !== id);
+    customFoodsRef.current = next;
     dispatch({ type: 'DELETE_CUSTOM_FOOD', payload: id });
-    await saveCustomFoods(state.customFoods.filter((f) => f.id !== id));
-  }, [state.customFoods]);
+    await saveCustomFoods(next);
+  }, []);
 
   const addCarbCyclePlan = useCallback(async (plan: Omit<CarbCyclePlan, 'id'>): Promise<CarbCyclePlan> => {
     const newPlan: CarbCyclePlan = { ...plan, id: generateId() };

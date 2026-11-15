@@ -9,8 +9,9 @@ import { calculateNutritionRecommendation, getRecommendedFoods, getAllFoods } fr
 import { getCarbCycleDay } from "@/lib/carb-cycle";
 import { getTodayString } from "@/lib/storage";
 import { buildCustomNutritionPlan, formatPlanSummary, macroPercentages } from "@/lib/nutrition-plan";
-import type { NutritionLogItem, FoodLibraryItem, NutritionGoal, FoodCategory, CarbCycleDay, CarbCyclePlan } from "@/lib/types";
-import { NUTRITION_GOAL_NAMES, CARB_DAY_NAMES } from "@/lib/types";
+import type { NutritionLogItem, FoodLibraryItem, NutritionGoal, FoodCategory, CarbCycleDay, CarbCyclePlan, MealType } from "@/lib/types";
+import { NUTRITION_GOAL_NAMES, CARB_DAY_NAMES, MEAL_TYPE_NAMES } from "@/lib/types";
+import { inferMealType } from "@/lib/nutrition-log";
 
 const FOOD_CATEGORIES: FoodCategory[] = ["protein", "carbs", "fats", "vegetables", "fruits", "other"];
 
@@ -43,6 +44,10 @@ export default function NutritionScreen() {
   const [protein, setProtein] = useState("");
   const [carbs, setCarbs] = useState("");
   const [fats, setFats] = useState("");
+  // 每条记录都要有餐次 / 单位 / 备注，和 AI 记录走同一套字段口径。
+  const [entryMealType, setEntryMealType] = useState<MealType>(inferMealType());
+  const [entryUnit, setEntryUnit] = useState<"g" | "ml" | "serving">("g");
+  const [entryNotes, setEntryNotes] = useState("");
   const [date] = useState(getTodayString());
 
   const [showCustomFoodModal, setShowCustomFoodModal] = useState(false);
@@ -244,10 +249,13 @@ export default function NutritionScreen() {
           ...editingItem,
           name: foodName.trim(),
           quantity: quantityNum,
+          unit: entryUnit,
           calories: caloriesNum,
           protein: proteinNum,
           carbs: carbsNum,
           fats: fatsNum,
+          mealType: entryMealType,
+          notes: entryNotes.trim() || undefined,
         };
         await updateNutritionEntry(date, updatedItem);
         Alert.alert("成功", "记录已更新");
@@ -257,12 +265,14 @@ export default function NutritionScreen() {
           foodId: selectedFood?.id,
           name: foodName.trim(),
           quantity: quantityNum,
-          unit: "g",
+          unit: entryUnit,
           calories: caloriesNum,
           protein: proteinNum,
           carbs: carbsNum,
           fats: fatsNum,
           source: selectedFood?.source || "quick",
+          mealType: entryMealType,
+          notes: entryNotes.trim() || undefined,
         });
         Alert.alert("成功", "记录已添加");
       }
@@ -273,6 +283,9 @@ export default function NutritionScreen() {
       setProtein("");
       setCarbs("");
       setFats("");
+      setEntryNotes("");
+      setEntryUnit("g");
+      setEntryMealType(inferMealType());
       setSelectedFood(null);
       setEditingItem(null);
       setIsAddingEntry(false);
@@ -609,6 +622,42 @@ export default function NutritionScreen() {
                 placeholderTextColor={colors.muted}
                 className="bg-background rounded-lg px-3 py-2 text-foreground border border-border mb-3"
               />
+              {/* 餐次 / 单位 / 备注：和 AI 记录保持同一套字段，避免记录残缺 */}
+              <View className="flex-row items-center gap-2 mb-3 flex-wrap">
+                <Text className="text-muted text-sm">餐次</Text>
+                {(["breakfast", "lunch", "dinner", "snack"] as MealType[]).map((m) => (
+                  <TouchableOpacity
+                    key={m}
+                    onPress={() => setEntryMealType(m)}
+                    className={`px-3 py-1.5 rounded-lg ${entryMealType === m ? "bg-primary" : "bg-background border border-border"}`}
+                  >
+                    <Text className={entryMealType === m ? "text-background text-xs" : "text-foreground text-xs"}>
+                      {MEAL_TYPE_NAMES[m]}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <View className="flex-row items-center gap-2 mb-3">
+                <Text className="text-muted text-sm">单位</Text>
+                {(["g", "ml", "serving"] as const).map((u) => (
+                  <TouchableOpacity
+                    key={u}
+                    onPress={() => setEntryUnit(u)}
+                    className={`px-3 py-1.5 rounded-lg ${entryUnit === u ? "bg-primary" : "bg-background border border-border"}`}
+                  >
+                    <Text className={entryUnit === u ? "text-background text-xs" : "text-foreground text-xs"}>
+                      {u === "g" ? "克(g)" : u === "ml" ? "毫升(ml)" : "份"}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <TextInput
+                value={entryNotes}
+                onChangeText={setEntryNotes}
+                placeholder="备注（做法、品牌，可留空）"
+                placeholderTextColor={colors.muted}
+                className="bg-background rounded-lg px-3 py-2 text-foreground border border-border mb-3"
+              />
               <View className="flex-row gap-2 mb-3">
                 <TextInput
                   value={quantity}
@@ -690,6 +739,9 @@ export default function NutritionScreen() {
                   setProtein(String(item.protein));
                   setCarbs(String(item.carbs));
                   setFats(String(item.fats));
+                  setEntryUnit(item.unit || "g");
+                  setEntryMealType(item.mealType || inferMealType());
+                  setEntryNotes(item.notes || "");
                   setIsAddingEntry(true);
                 }}
                 onLongPress={() => handleDeleteItem(item)}
@@ -698,10 +750,16 @@ export default function NutritionScreen() {
               >
                 <View className="flex-row items-center justify-between">
                   <View className="flex-1">
-                    <Text className="text-foreground font-medium">{item.name}</Text>
-                    <Text className="text-muted text-sm">
-                      {item.quantity}g · {item.calories} kcal
+                    <Text className="text-foreground font-medium">
+                      {item.name}
+                      {item.mealType ? ` · ${MEAL_TYPE_NAMES[item.mealType]}` : ""}
                     </Text>
+                    <Text className="text-muted text-sm">
+                      {item.quantity}{item.unit === "serving" ? "份" : item.unit || "g"} · {item.calories} kcal · 蛋白 {item.protein}g / 碳水 {item.carbs}g / 脂肪 {item.fats}g
+                    </Text>
+                    {item.notes ? (
+                      <Text className="text-muted text-xs mt-1" numberOfLines={1}>{item.notes}</Text>
+                    ) : null}
                   </View>
                   <Text className="text-primary font-semibold">{item.calories}</Text>
                 </View>

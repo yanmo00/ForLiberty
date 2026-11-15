@@ -111,6 +111,16 @@ export interface FoodLibraryItem {
 
 export type FoodLogSource = 'database' | 'custom' | 'quick';
 
+// 餐次：每条饮食记录都必须有归属，AI 没给时按钟点推断（见 lib/nutrition-log.ts）。
+export type MealType = 'breakfast' | 'lunch' | 'dinner' | 'snack';
+
+export const MEAL_TYPE_NAMES: Record<MealType, string> = {
+  breakfast: '早餐',
+  lunch: '午餐',
+  dinner: '晚餐',
+  snack: '加餐',
+};
+
 export interface NutritionLogItem {
   id: string;
   foodId?: string;
@@ -123,6 +133,9 @@ export interface NutritionLogItem {
   fats: number;
   source: FoodLogSource;
   loggedAt: string;
+  // 以下两项旧数据可能没有，故为可选；新写入的记录由 normalizeNutritionLogInput 保证齐全。
+  mealType?: MealType;
+  notes?: string;
 }
 
 export interface NutritionEntry {

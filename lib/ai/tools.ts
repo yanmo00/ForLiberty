@@ -9,6 +9,7 @@ import type {
 } from "../types";
 import { generateId, getTodayString } from "../storage";
 import { buildCustomNutritionPlan, formatPlanSummary } from "../nutrition-plan";
+import { summarizeNutritionLogItem } from "../nutrition-log";
 
 export interface ToolResult {
   ok: boolean;
@@ -248,21 +249,70 @@ export const AI_TOOLS: Record<string, unknown>[] = [
     type: "function",
     function: {
       name: "log_nutrition",
-      description: "记录一条饮食（食物名称 + 热量宏量）。",
+      description:
+        "记录一条饮食。必须写全：食物名、份量、单位、热量、蛋白/碳水/脂肪、餐次。只给食物名或只给热量会让记录残缺；数值不确定就按常见食物估算，确实为 0 才填 0。一餐里有多种食物请改用 log_meal。",
       parameters: {
         type: "object",
         properties: {
           name: { type: "string", description: "食物名称" },
-          quantity: { type: "number", description: "份量数值" },
+          quantity: { type: "number", description: "份量数值：g/ml 填克或毫升，serving 填份数" },
           unit: { type: "string", enum: ["g", "ml", "serving"] },
-          calories: { type: "number" },
-          carbs: { type: "number" },
-          protein: { type: "number" },
-          fats: { type: "number" },
+          calories: { type: "number", description: "热量 kcal" },
+          carbs: { type: "number", description: "碳水 g" },
+          protein: { type: "number", description: "蛋白质 g" },
+          fats: { type: "number", description: "脂肪 g" },
+          mealType: {
+            type: "string",
+            enum: ["breakfast", "lunch", "dinner", "snack"],
+            description: "早餐/午餐/晚餐/加餐，省略按当前时间推断",
+          },
           date: { type: "string", description: "YYYY-MM-DD，省略为今天" },
+          foodId: { type: "string", description: "食物库 ID，省略时按名称自动匹配" },
           source: { type: "string", enum: ["database", "custom", "quick"] },
+          notes: { type: "string", description: "备注（做法、品牌等）" },
         },
-        required: ["name", "quantity"],
+        required: ["name", "quantity", "unit", "calories", "carbs", "protein", "fats"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "log_meal",
+      description:
+        "一次记录一餐里的所有食物（推荐）。用户说「早餐吃了鸡蛋、牛奶、面包」时必须把每样食物逐项列出，不要合并成一条、也不要只记第一样。每项都要写全份量、单位、热量与三大宏量。",
+      parameters: {
+        type: "object",
+        properties: {
+          mealType: {
+            type: "string",
+            enum: ["breakfast", "lunch", "dinner", "snack"],
+            description: "这一餐的餐次，省略按当前时间推断",
+          },
+          date: { type: "string", description: "YYYY-MM-DD，省略为今天" },
+          notes: { type: "string", description: "整餐备注" },
+          items: {
+            type: "array",
+            description: "这餐吃的所有食物，逐项列出",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "食物名称" },
+                quantity: { type: "number", description: "份量数值" },
+                unit: { type: "string", enum: ["g", "ml", "serving"] },
+                calories: { type: "number" },
+                carbs: { type: "number" },
+                protein: { type: "number" },
+                fats: { type: "number" },
+                foodId: { type: "string" },
+                source: { type: "string", enum: ["database", "custom", "quick"] },
+                notes: { type: "string" },
+              },
+              required: ["name", "quantity", "calories", "carbs", "protein", "fats"],
+            },
+          },
+        },
+        required: ["items"],
       },
     },
   },
@@ -544,22 +594,42 @@ export async function executeToolCall(
         return { ok: true, summary: "已结束并记录本次训练" };
       }
 
-      case "log_nutrition": {
-        const entry = await app.addNutritionEntry({
-          date: args.date || getTodayString(),
-          foodId: undefined,
-          name: args.name,
-          quantity: args.quantity,
-          unit: (args.unit ?? "g") as "g" | "ml" | "serving",
-          calories: args.calories ?? 0,
-          carbs: args.carbs ?? 0,
-          protein: args.protein ?? 0,
-          fats: args.fats ?? 0,
-          source: (args.source ?? "quick") as "database" | "custom" | "quick",
-        });
+      // 单条与整餐共用同一套写入路径。字段的最终补全（食物库折算宏量、foodId、
+      // source、餐次、单位）由 app.addNutritionEntry → normalizeNutritionLogInput 统一完成，
+      // 所以即使模型漏填也不会出现只剩食物名的残缺记录。
+      case "log_nutrition":
+      case "log_meal": {
+        const rawItems: any[] = name === "log_meal"
+          ? Array.isArray(args.items) ? args.items : []
+          : [args];
+        if (!rawItems.length) {
+          return { ok: false, summary: "没有可记录的食物：items 为空" };
+        }
+        const lines: string[] = [];
+        let savedDate = args.date || getTodayString();
+        for (const raw of rawItems) {
+          const draft = {
+            date: args.date || raw.date || getTodayString(),
+            name: String(raw.name ?? ""),
+            foodId: raw.foodId,
+            quantity: Number(raw.quantity ?? 100),
+            unit: (raw.unit ?? "g") as "g" | "ml" | "serving",
+            calories: Number(raw.calories ?? 0),
+            carbs: Number(raw.carbs ?? 0),
+            protein: Number(raw.protein ?? 0),
+            fats: Number(raw.fats ?? 0),
+            source: (raw.source ?? "quick") as "database" | "custom" | "quick",
+            mealType: raw.mealType ?? args.mealType,
+            notes: raw.notes ?? args.notes,
+          } as Parameters<AppContextType["addNutritionEntry"]>[0];
+          const entry = await app.addNutritionEntry(draft);
+          savedDate = entry.date;
+          const last = entry.items[entry.items.length - 1];
+          if (last) lines.push(`· ${summarizeNutritionLogItem(last)}`);
+        }
         return {
           ok: true,
-          summary: `已记录饮食（${entry.date}）：${args.name} ${args.calories ?? 0} kcal`,
+          summary: `已完整记录 ${lines.length} 项饮食（${savedDate}）：\n${lines.join("\n")}`,
         };
       }
 
