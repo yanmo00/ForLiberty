@@ -52,6 +52,8 @@ export interface WorkoutSession {
 export interface TemplateExercise {
   id: string;
   exerciseId: string;
+  // 模板内自定义显示名；留空则用动作库里的原名。改这里不会改动动作库。
+  name?: string;
   order: number;
   sets: number;
   reps: number;

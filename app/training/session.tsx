@@ -307,7 +307,7 @@ export default function WorkoutSessionScreen() {
                     >
                       <View className="flex-row items-center justify-between">
                         <View>
-                          <Text className="text-foreground font-medium">{meta?.name || "动作"}</Text>
+                          <Text className="text-foreground font-medium">{exercise.name || meta?.name || "动作"}</Text>
                           <Text className="text-muted text-sm">
                             {exercise.sets} 组 × {exercise.reps} 次{exercise.weight ? ` · ${exercise.weight}kg` : ""}
                           </Text>
@@ -339,7 +339,7 @@ export default function WorkoutSessionScreen() {
             {selectedExercise ? (
               <View>
                 <Text className="text-foreground font-semibold text-lg">
-                  {selectedExercise.name}
+                  {state.currentSession?.plan?.exercises?.find((ex) => ex.exerciseId === selectedExercise.id)?.name || selectedExercise.name}
                 </Text>
                 <Text className="text-muted text-sm">
                   {MUSCLE_GROUP_NAMES[selectedExercise.muscleGroup]}

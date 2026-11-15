@@ -148,6 +148,8 @@ function normalizeTemplateDays(rawDays: any[], exercises: Exercise[]) {
       exercisesList = day.exercises.map((ex: any, exIndex: number) => ({
         id: ex.id ?? generateId(),
         exerciseId: ex.exerciseId ?? ex.id,
+        // 模板里改过的动作名必须原样保留，否则重启后被动作库原名覆盖。
+        name: typeof ex.name === "string" ? ex.name : undefined,
         order: Number(ex.order ?? exIndex + 1),
         sets: Number(ex.sets ?? DEFAULT_SETS),
         reps: Number(ex.reps ?? DEFAULT_REPS),

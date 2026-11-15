@@ -153,7 +153,7 @@ export default function TrainingScreen() {
                     const meta = state.exercises.find((item) => item.id === exercise.exerciseId);
                     return (
                       <View key={exercise.id} className="bg-background rounded-2xl px-4 py-3 border border-border/70">
-                        <Text className="text-foreground font-medium">{meta?.name || "动作"}</Text>
+                        <Text className="text-foreground font-medium">{exercise.name || meta?.name || "动作"}</Text>
                         <Text className="text-muted text-sm">
                           {exercise.sets} 组 × {exercise.reps} 次{exercise.weight ? ` · ${exercise.weight}kg` : ""}
                         </Text>

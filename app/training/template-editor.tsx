@@ -106,7 +106,7 @@ export default function TemplateEditorScreen() {
     setDays((prevDays) => prevDays.map((day) => {
       if (day.dayIndex !== activeDayIndex) return day;
       const numericValue = value.trim() === "" ? undefined : Number(value);
-      const nextValue = field === "notes"
+      const nextValue = field === "notes" || field === "name"
         ? value
         : field === "sets" || field === "reps"
           ? numericValue ?? 0
@@ -323,7 +323,17 @@ export default function TemplateEditorScreen() {
                   style={[styles.exerciseCard, { backgroundColor: colors.background, borderColor: colors.border }]}
                 >
                   <View style={styles.exerciseHeader}>
-                    <Text style={[styles.exerciseName, { color: colors.text }]}>#{index + 1} {state.exercises.find((e) => e.id === exercise.exerciseId)?.name || "动作"}</Text>
+                    <View style={styles.exerciseNameWrap}>
+                      <Text style={[styles.exerciseOrder, { color: colors.icon }]}>#{index + 1}</Text>
+                      <TextInput
+                        style={[styles.exerciseNameInput, { color: colors.text, borderBottomColor: colors.border }]}
+                        value={exercise.name ?? state.exercises.find((e) => e.id === exercise.exerciseId)?.name ?? "动作"}
+                        onChangeText={(value) => updateExercise(exercise.id, "name", value)}
+                        placeholder={state.exercises.find((e) => e.id === exercise.exerciseId)?.name || "动作名称"}
+                        placeholderTextColor={colors.icon}
+                        returnKeyType="done"
+                      />
+                    </View>
                     <TouchableOpacity onPress={() => removeExercise(exercise.id)}>
                       <IconSymbol name="trash" size={20} color="red" />
                     </TouchableOpacity>
@@ -518,9 +528,22 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: 12,
   },
-  exerciseName: {
+  exerciseNameWrap: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: 12,
+  },
+  exerciseOrder: {
+    fontSize: 14,
+    marginRight: 6,
+  },
+  exerciseNameInput: {
+    flex: 1,
     fontSize: 16,
     fontWeight: "600",
+    paddingVertical: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
   exerciseRow: {
     flexDirection: "row",
