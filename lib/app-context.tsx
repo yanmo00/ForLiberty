@@ -6,6 +6,7 @@ import type {
   WorkoutSet,
   NutritionEntry,
   NutritionLogItem,
+  MealCombo,
   FoodLibraryItem,
   BodyMetricEntry,
   ExerciseAbility,
@@ -20,6 +21,7 @@ import {
   loadWorkoutTemplates,
   loadWorkoutSessions,
   loadNutritionEntries,
+  loadMealCombos,
   loadCustomFoods,
   loadBodyMetrics,
   loadExerciseAbilities,
@@ -32,6 +34,7 @@ import {
   saveWorkoutTemplates,
   saveWorkoutSessions,
   saveNutritionEntries,
+  saveMealCombos,
   saveCustomFoods,
   saveBodyMetrics,
   saveExerciseAbilities,
@@ -56,6 +59,7 @@ interface AppState {
   workoutTemplates: WorkoutTemplate[];
   workoutSessions: WorkoutSession[];
   nutritionEntries: NutritionEntry[];
+  mealCombos: MealCombo[];
   customFoods: FoodLibraryItem[];
   bodyMetrics: BodyMetricEntry[];
   exerciseAbilities: ExerciseAbility[];
@@ -84,6 +88,10 @@ type AppAction =
   | { type: 'ADD_NUTRITION_ENTRY'; payload: NutritionEntry }
   | { type: 'UPDATE_NUTRITION_ENTRY'; payload: NutritionEntry }
   | { type: 'DELETE_NUTRITION_ENTRY'; payload: string }
+  | { type: 'SET_MEAL_COMBOS'; payload: MealCombo[] }
+  | { type: 'ADD_MEAL_COMBO'; payload: MealCombo }
+  | { type: 'UPDATE_MEAL_COMBO'; payload: MealCombo }
+  | { type: 'DELETE_MEAL_COMBO'; payload: string }
   | { type: 'SET_CUSTOM_FOODS'; payload: FoodLibraryItem[] }
   | { type: 'ADD_CUSTOM_FOOD'; payload: FoodLibraryItem }
   | { type: 'UPDATE_CUSTOM_FOOD'; payload: FoodLibraryItem }
@@ -119,6 +127,7 @@ const initialState: AppState = {
   workoutTemplates: [],
   workoutSessions: [],
   nutritionEntries: [],
+  mealCombos: [],
   customFoods: [],
   bodyMetrics: [],
   exerciseAbilities: [],
@@ -219,6 +228,21 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         nutritionEntries: state.nutritionEntries.filter((e) => e.id !== action.payload),
       };
+
+    case 'SET_MEAL_COMBOS':
+      return { ...state, mealCombos: action.payload };
+
+    case 'ADD_MEAL_COMBO':
+      return { ...state, mealCombos: [...state.mealCombos, action.payload] };
+
+    case 'UPDATE_MEAL_COMBO':
+      return {
+        ...state,
+        mealCombos: state.mealCombos.map((c) => (c.id === action.payload.id ? action.payload : c)),
+      };
+
+    case 'DELETE_MEAL_COMBO':
+      return { ...state, mealCombos: state.mealCombos.filter((c) => c.id !== action.payload) };
 
     case 'SET_CUSTOM_FOODS':
       return { ...state, customFoods: action.payload };
@@ -404,6 +428,9 @@ export interface AppContextType {
   addNutritionEntry: (entry: NutritionLogInput) => Promise<NutritionEntry>;
   updateNutritionEntry: (date: string, item: NutritionLogItem) => Promise<void>;
   deleteNutritionEntry: (date: string, id: string) => Promise<void>;
+  addMealCombo: (combo: Omit<MealCombo, 'id'>) => Promise<MealCombo>;
+  updateMealCombo: (combo: MealCombo) => Promise<void>;
+  deleteMealCombo: (id: string) => Promise<void>;
   addCustomFood: (food: Omit<FoodLibraryItem, 'id'>) => Promise<FoodLibraryItem>;
   updateCustomFood: (food: FoodLibraryItem) => Promise<void>;
   deleteCustomFood: (id: string) => Promise<void>;
@@ -441,6 +468,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // AI 一轮里连续记录多份食物时每次都基于同一份旧快照 → 后写覆盖前写，只剩一条记录。
   // 改成「先刷新镜像、再按调用顺序串行写盘」后，同轮多次写入会逐条累加。
   const nutritionEntriesRef = useRef<NutritionEntry[]>(state.nutritionEntries);
+  const mealCombosRef = useRef<MealCombo[]>(state.mealCombos);
   const customFoodsRef = useRef<FoodLibraryItem[]>(state.customFoods);
   const nutritionSaveChainRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -464,6 +492,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           workoutTemplates,
           workoutSessions,
           nutritionEntries,
+          mealCombos,
           customFoods,
           bodyMetrics,
           exerciseAbilities,
@@ -477,6 +506,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           loadWorkoutTemplates(),
           loadWorkoutSessions(),
           loadNutritionEntries(),
+          loadMealCombos(),
           loadCustomFoods(),
           loadBodyMetrics(),
           loadExerciseAbilities(),
@@ -494,6 +524,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             workoutTemplates,
             workoutSessions,
             nutritionEntries,
+            mealCombos,
             customFoods,
             bodyMetrics,
             exerciseAbilities,
@@ -505,6 +536,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         });
         // 磁盘数据加载完后同步镜像，之后的写操作都以镜像为基准。
         nutritionEntriesRef.current = nutritionEntries;
+        mealCombosRef.current = mealCombos;
         customFoodsRef.current = customFoods;
       } catch (error) {
         console.error('Error loading data:', error);
@@ -764,6 +796,36 @@ export function AppProvider({ children }: { children: ReactNode }) {
     );
   }, [persistNutritionEntries]);
 
+  // 套餐走自定义食物同样的「镜像 + 落盘」模式：连续新建/编辑多个套餐不会互相覆盖。
+  const addMealCombo = useCallback(async (combo: Omit<MealCombo, 'id'>): Promise<MealCombo> => {
+    const now = new Date().toISOString();
+    const newCombo: MealCombo = {
+      ...combo,
+      id: generateId(),
+      createdAt: combo.createdAt ?? now,
+      updatedAt: now,
+    };
+    const next = [...mealCombosRef.current, newCombo];
+    mealCombosRef.current = next;
+    dispatch({ type: 'ADD_MEAL_COMBO', payload: newCombo });
+    await saveMealCombos(next);
+    return newCombo;
+  }, []);
+
+  const updateMealCombo = useCallback(async (combo: MealCombo) => {
+    const next = mealCombosRef.current.map((c) => (c.id === combo.id ? combo : c));
+    mealCombosRef.current = next;
+    dispatch({ type: 'UPDATE_MEAL_COMBO', payload: combo });
+    await saveMealCombos(next);
+  }, []);
+
+  const deleteMealCombo = useCallback(async (id: string) => {
+    const next = mealCombosRef.current.filter((c) => c.id !== id);
+    mealCombosRef.current = next;
+    dispatch({ type: 'DELETE_MEAL_COMBO', payload: id });
+    await saveMealCombos(next);
+  }, []);
+
   const addCustomFood = useCallback(async (food: Omit<FoodLibraryItem, 'id'>): Promise<FoodLibraryItem> => {
     const newFood: FoodLibraryItem = { ...food, id: generateId(), isCustom: true };
     const next = [...customFoodsRef.current, newFood];
@@ -901,6 +963,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     addNutritionEntry,
     updateNutritionEntry,
     deleteNutritionEntry,
+    addMealCombo,
+    updateMealCombo,
+    deleteMealCombo,
     addCustomFood,
     updateCustomFood,
     deleteCustomFood,

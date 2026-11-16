@@ -810,8 +810,9 @@ export default function AIScreen() {
     const activeCustomPlan = state.userProfile.customNutritionPlan;
     const systemPrompt =
       generateSystemPrompt() +
-      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、添加食物、创建碳循环计划、保存自定义营养方案、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么。" +
+      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加动作、创建训练计划、开始/结束训练、记录饮食、删除/修改饮食记录、添加食物、创建碳循环计划、保存自定义营养方案、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么。" +
       "\n\n[饮食记录] 用户说一餐吃了多样食物时，必须调用 log_meal 把每样食物逐项放进 items，不要合并、不要只记第一样；每项都写全 name、quantity、unit、calories、carbs、protein、fats 和 mealType，数值不确定就按常见份量估算，不要省略字段。只记一样食物时用 log_nutrition，字段同样要全。记录后在回复里列出实际保存的食物与宏量供核对。" +
+      "\n\n[删除/修改饮食记录] 用户要删记录时调用 delete_nutrition（用「今日饮食明细」里的 id，或食物名 + 日期），要改克数/营养值时调用 update_nutrition（只改克数又想按比例联动就带 scaleMacros: true）。绝对不要通过再记一遍正确数据来覆盖旧记录——那会新增重复记录、原来的还在。删/改后回复里说明动的是哪几条。" +
       "\n\n[营养方案] 当用户询问饮食/营养参数建议（每日热量、蛋白、碳水、脂肪），或你主动给出一套具体数值方案时，务必调用 save_custom_nutrition_plan 把四个数值保存到「饮食 → 营养建议 → 自定义」并设为当前每日目标，回复里说明已保存；用户要求取消时可调用 clear_custom_nutrition_plan。回复里请用列表把四个数字写清楚，方便用户核对。" +
       (activeCustomPlan?.enabled
         ? `\n\n[当前自定义营养目标] ${formatPlanSummary(activeCustomPlan)}（已生效，给饮食建议时以此为准）`

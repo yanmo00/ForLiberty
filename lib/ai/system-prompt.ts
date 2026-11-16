@@ -1,4 +1,5 @@
 import type { AISnapshot } from "./data-model";
+import { MEAL_TYPE_NAMES } from "../types";
 import { KNOWLEDGE_BASE } from "./knowledge-base";
 
 function formatRecentSessions(sessions: AISnapshot["training"]["recentSessions"]) {
@@ -14,6 +15,16 @@ function formatRecentNutrition(entries: AISnapshot["nutrition"]["recentEntries"]
     entries.reduce((sum, entry) => sum + entry.totalCalories, 0) / entries.length
   );
   return `近${entries.length}天平均热量 ${avgCalories} kcal`;
+}
+
+function formatTodayNutritionItems(entry: AISnapshot["nutrition"]["todayEntry"]) {
+  if (!entry?.items?.length) return "暂无";
+  return entry.items
+    .map(
+      (i) =>
+        `${i.id}｜${i.name} ${i.quantity}${i.unit}｜${i.calories}kcal｜${MEAL_TYPE_NAMES[i.mealType ?? "snack"]}`
+    )
+    .join("；");
 }
 
 export function buildSystemPrompt(snapshot: AISnapshot): string {
@@ -39,6 +50,8 @@ export function buildSystemPrompt(snapshot: AISnapshot): string {
 - 近期饮食：${formatRecentNutrition(nutrition.recentEntries)}
 - 最新体测：体重 ${metrics.latestWeight ?? "-"} kg，体脂 ${metrics.latestBodyFat ?? "-"}%，BMI ${metrics.latestBmi ?? "-"}
 - 今日饮食：热量 ${nutrition.todayEntry?.totalCalories ?? 0} kcal
+- 今日饮食明细（请用这里的 ID 精确定位要删/改的记录）：
+  ${formatTodayNutritionItems(nutrition.todayEntry)}
 
 回答要求：
 1) 先给出 3-5 条今日可执行建议（训练/饮食/恢复/心理）。
@@ -50,6 +63,12 @@ export function buildSystemPrompt(snapshot: AISnapshot): string {
 - 用户描述一餐吃了多样食物，用 log_meal 把每样食物逐项放进 items，不要合并成一条、不要只记第一样。
 - 每项都要写全 name、quantity、unit、calories、carbs、protein、fats，并给出 mealType；数值不确定就按常见份量估算，确实没有才填 0，不要省略字段。
 - 记录完成后在回复里列出实际保存的食物、份量与宏量，方便用户核对有没有漏记。
+
+删除 / 修改饮食记录（严格遵守）：
+- 用户说「删掉 / 取消 / 去掉 / 记错了不要那条」时，调用 delete_nutrition，并从「今日饮食明细」里取对应的 id 传入；不要重新调用 log_meal / log_nutrition 去「覆盖」，那只会新增记录、原来的还在。
+- 用户说「把克数改成 X / 份量记错了 / 热量改一下」时，调用 update_nutrition；只改克数且要按比例联动营养值时带 scaleMacros: true。
+- 用户没指明哪条、今日明细里有多条相似记录时，先问清楚或用 delete_nutrition 的名称匹配（可加 mealType 缩小范围）；删除后回复里说明删了哪几条。
+- 不确定时宁可先问，也不要用「重新记录一遍正确的」来处理删除或修改。
 
 知识库（可引用）：
 ${KNOWLEDGE_BASE}`;

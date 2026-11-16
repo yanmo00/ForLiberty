@@ -9,6 +9,8 @@ import type {
   WorkoutSession,
   NutritionEntry,
   NutritionLogItem,
+  MealCombo,
+  MealComboItem,
   FoodLibraryItem,
   BodyMetricEntry,
   ExerciseAbility,
@@ -27,6 +29,7 @@ const STORAGE_KEYS = {
   WORKOUT_TEMPLATES: '@health_app:workout_templates',
   WORKOUT_SESSIONS: '@health_app:workout_sessions',
   NUTRITION_ENTRIES: '@health_app:nutrition_entries',
+  MEAL_COMBOS: '@health_app:meal_combos',
   CUSTOM_FOODS: '@health_app:custom_foods',
   BODY_METRICS: '@health_app:body_metrics',
   EXERCISE_ABILITIES: '@health_app:exercise_abilities',
@@ -320,6 +323,54 @@ export async function loadNutritionEntries(): Promise<NutritionEntry[]> {
   return normalized;
 }
 
+// 饮食套餐：把固定吃的那几样食物存成一套，之后一键整套餐记到某天。
+const MEAL_UNITS: MealComboItem["unit"][] = ["g", "ml", "serving"];
+const MEAL_TYPES = ["breakfast", "lunch", "dinner", "snack"];
+
+function normalizeComboItem(raw: any): MealComboItem | null {
+  const name = String(raw?.name ?? "").trim();
+  if (!name) return null;
+  const unit = MEAL_UNITS.includes(raw?.unit) ? raw.unit : "g";
+  return {
+    foodId: raw.foodId,
+    name,
+    quantity: Number(raw.quantity ?? 100) || 100,
+    unit,
+    calories: Number(raw.calories ?? 0) || 0,
+    carbs: Number(raw.carbs ?? 0) || 0,
+    protein: Number(raw.protein ?? 0) || 0,
+    fats: Number(raw.fats ?? 0) || 0,
+    source: ["database", "custom", "quick"].includes(raw?.source) ? raw.source : "quick",
+    mealType: MEAL_TYPES.includes(raw?.mealType) ? raw.mealType : undefined,
+    notes: typeof raw?.notes === "string" && raw.notes.trim() ? raw.notes.trim() : undefined,
+  };
+}
+
+function normalizeMealCombo(raw: any): MealCombo | null {
+  const name = String(raw?.name ?? "").trim();
+  const items = Array.isArray(raw?.items)
+    ? raw.items.map(normalizeComboItem).filter((i: MealComboItem | null): i is MealComboItem => !!i)
+    : [];
+  if (!name && items.length === 0) return null;
+  return {
+    id: raw.id ?? generateId(),
+    name: name || "未命名套餐",
+    items,
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+  };
+}
+
+export async function saveMealCombos(combos: MealCombo[]): Promise<void> {
+  await setItem(STORAGE_KEYS.MEAL_COMBOS, combos);
+}
+
+export async function loadMealCombos(): Promise<MealCombo[]> {
+  const stored = await getItem<any[]>(STORAGE_KEYS.MEAL_COMBOS, []);
+  if (!Array.isArray(stored)) return [];
+  return stored.map(normalizeMealCombo).filter((c: MealCombo | null): c is MealCombo => !!c);
+}
+
 // 自定义食物库
 export async function saveCustomFoods(foods: FoodLibraryItem[]): Promise<void> {
   await setItem(STORAGE_KEYS.CUSTOM_FOODS, foods);
@@ -437,6 +488,7 @@ export async function exportAllData(): Promise<AppState> {
     workoutTemplates,
     workoutSessions,
     nutritionEntries,
+    mealCombos,
     customFoods,
     bodyMetrics,
     exerciseAbilities,
@@ -450,6 +502,7 @@ export async function exportAllData(): Promise<AppState> {
     loadWorkoutTemplates(),
     loadWorkoutSessions(),
     loadNutritionEntries(),
+    loadMealCombos(),
     loadCustomFoods(),
     loadBodyMetrics(),
     loadExerciseAbilities(),
@@ -465,6 +518,7 @@ export async function exportAllData(): Promise<AppState> {
     workoutTemplates,
     workoutSessions,
     nutritionEntries,
+    mealCombos,
     customFoods,
     bodyMetrics,
     exerciseAbilities,
@@ -524,6 +578,9 @@ export async function importAllData(data: Partial<AppState>): Promise<void> {
   }
   if (data.nutritionEntries) {
     promises.push(saveNutritionEntries(data.nutritionEntries));
+  }
+  if (data.mealCombos) {
+    promises.push(saveMealCombos(data.mealCombos));
   }
   if (data.customFoods) {
     promises.push(saveCustomFoods(data.customFoods));

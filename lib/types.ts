@@ -151,6 +151,31 @@ export interface NutritionEntry {
   notes?: string;
 }
 
+// 饮食套餐：把「固定会吃的那一套食物」存成模板，之后一键整套餐记录到某一天。
+// 单项结构与 NutritionLogItem 对齐（少掉运行时字段 id/loggedAt），这样套餐里保存的
+// 份量和宏量和实际落库的记录完全一致，不会因按 100g 重算而和用户当时的记录对不上。
+export interface MealComboItem {
+  foodId?: string;
+  name: string;
+  quantity: number;
+  unit: 'g' | 'ml' | 'serving';
+  calories: number;
+  carbs: number;
+  protein: number;
+  fats: number;
+  source?: FoodLogSource;
+  mealType?: MealType;
+  notes?: string;
+}
+
+export interface MealCombo {
+  id: string;
+  name: string;
+  items: MealComboItem[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 // 碳循环日类型
 export type CarbDayType = 'high' | 'medium' | 'low';
 
@@ -314,6 +339,7 @@ export interface AppState {
   workoutTemplates: WorkoutTemplate[];
   workoutSessions: WorkoutSession[];
   nutritionEntries: NutritionEntry[];
+  mealCombos: MealCombo[];
   customFoods: FoodLibraryItem[];
   bodyMetrics: BodyMetricEntry[];
   exerciseAbilities: ExerciseAbility[];

@@ -6,6 +6,7 @@ import type {
   Equipment,
   FoodCategory,
   CarbDayType,
+  NutritionLogItem,
 } from "../types";
 import { generateId, getTodayString } from "../storage";
 import { buildCustomNutritionPlan, formatPlanSummary } from "../nutrition-plan";
@@ -320,6 +321,59 @@ export const AI_TOOLS: Record<string, unknown>[] = [
   {
     type: "function",
     function: {
+      name: "delete_nutrition",
+      description:
+        "删除已有的饮食记录（用户说删掉/取消/不要那条食物时必须用这个）。优先用 id（来自上下文的今日饮食明细），也可用食物名模糊匹配；默认只删今天，今天没有就删最近一条匹配的日期；allDates=true 则跨所有日期删。注意：删除就是删除，绝不要用 log_meal / log_nutrition 重新记录一套来「覆盖」，那会留下重复记录。",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "饮食记录 ID，最精确" },
+          name: { type: "string", description: "食物名称，模糊匹配" },
+          date: { type: "string", description: "YYYY-MM-DD，省略为今天/最近匹配日" },
+          mealType: {
+            type: "string",
+            enum: ["breakfast", "lunch", "dinner", "snack"],
+            description: "限定餐次",
+          },
+          allDates: { type: "boolean", description: "跨所有日期删除匹配项，默认 false" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_nutrition",
+      description:
+        "修改一条已有的饮食记录（份量、热量、宏量、餐次、备注）。用户想改记录时用这个，不要先删再加。只改 quantity 且带 scaleMacros=true 时，热量与三大宏量会按原记录的比例同步变化（适合原本不是 100g 的记录）。",
+      parameters: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "记录 ID，最精确" },
+          name: { type: "string", description: "食物名称，模糊匹配" },
+          date: { type: "string", description: "YYYY-MM-DD，省略为今天/最近匹配日" },
+          quantity: { type: "number", description: "新份量数值" },
+          unit: { type: "string", enum: ["g", "ml", "serving"] },
+          calories: { type: "number" },
+          carbs: { type: "number" },
+          protein: { type: "number" },
+          fats: { type: "number" },
+          mealType: {
+            type: "string",
+            enum: ["breakfast", "lunch", "dinner", "snack"],
+          },
+          notes: { type: "string" },
+          scaleMacros: {
+            type: "boolean",
+            description: "只改 quantity 时按原记录比例同步热量与宏量，默认 false",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "add_custom_food",
       description: "往食物库加一个自定义食物（每 100g 营养）。",
       parameters: {
@@ -448,6 +502,84 @@ async function resolveExercise(
   );
   if (existing) return existing;
   return app.addExercise({ name, muscleGroup, equipment });
+}
+
+type NutritionCandidate = { date: string; item: NutritionLogItem };
+
+const NUTRITION_MEAL_TYPES = ["breakfast", "lunch", "dinner", "snack"];
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function hasArg(args: Record<string, any>, key: string): boolean {
+  const value = args[key];
+  return value !== undefined && value !== null && value !== "";
+}
+
+function matchesName(itemName: string, query: string): boolean {
+  const a = itemName.toLowerCase();
+  const b = query.trim().toLowerCase();
+  return !!b && (a.includes(b) || b.includes(a));
+}
+
+/** 收集所有带日期的饮食条目，用于按 id/名称/餐次/日期定位。 */
+function allNutritionItems(app: AppContextType): NutritionCandidate[] {
+  return app.state.nutritionEntries.flatMap((entry) =>
+    entry.items.map((item) => ({ date: entry.date, item }))
+  );
+}
+
+/** 删除用：可命中多条；未指定日期时优先今天，再退到最近一条匹配的日期。 */
+function findNutritionForDelete(
+  app: AppContextType,
+  args: Record<string, any>
+): NutritionCandidate[] {
+  const allDates = args.allDates === true;
+  const dateGiven = DATE_PATTERN.test(String(args.date ?? ""));
+
+  let pool = allNutritionItems(app).filter(
+    (c) => allDates || !dateGiven || c.date === args.date
+  );
+  if (hasArg(args, "id")) pool = pool.filter((c) => c.item.id === args.id);
+  if (hasArg(args, "name")) pool = pool.filter((c) => matchesName(c.item.name, String(args.name)));
+  if (NUTRITION_MEAL_TYPES.includes(args.mealType)) {
+    pool = pool.filter((c) => c.item.mealType === args.mealType);
+  }
+
+  if (!allDates && !dateGiven && !hasArg(args, "id") && pool.length > 0) {
+    const dates = Array.from(new Set(pool.map((c) => c.date))).sort((a, b) => b.localeCompare(a));
+    pool = pool.filter((c) => c.date === dates[0]);
+  }
+  return pool;
+}
+
+/** 修改用：只取一条，id 优先；名称匹配时优先今天，再退到最近日期。 */
+function findNutritionForUpdate(
+  app: AppContextType,
+  args: Record<string, any>
+): NutritionCandidate | undefined {
+  const all = allNutritionItems(app);
+  if (hasArg(args, "id")) {
+    const byId = all.find((c) => c.item.id === args.id);
+    if (byId) return byId;
+  }
+  if (!hasArg(args, "name")) return undefined;
+
+  let pool = all.filter((c) => matchesName(c.item.name, String(args.name)));
+  if (DATE_PATTERN.test(String(args.date ?? ""))) {
+    pool = pool.filter((c) => c.date === args.date);
+  } else {
+    const today = getTodayString();
+    const todayMatches = pool.filter((c) => c.date === today);
+    if (todayMatches.length) {
+      pool = todayMatches;
+    } else if (pool.length) {
+      const latest = pool.map((c) => c.date).sort((a, b) => b.localeCompare(a))[0];
+      pool = pool.filter((c) => c.date === latest);
+    }
+  }
+  if (NUTRITION_MEAL_TYPES.includes(args.mealType)) {
+    pool = pool.filter((c) => c.item.mealType === args.mealType);
+  }
+  return pool[0];
 }
 
 export async function executeToolCall(
@@ -631,6 +763,86 @@ export async function executeToolCall(
         return {
           ok: true,
           summary: `已完整记录 ${lines.length} 项饮食（${savedDate}）：\n${lines.join("\n")}`,
+        };
+      }
+
+      // 删除/修改走 app 的串行写入口；按 id / 名称 / 日期 / 餐次定位到具体的某条记录，
+      // 不再靠「重新记一遍正确的」去覆盖旧的——那正是重复记录的根源。
+      case "delete_nutrition": {
+        const hasFilter =
+          hasArg(args, "id") ||
+          hasArg(args, "name") ||
+          hasArg(args, "mealType") ||
+          DATE_PATTERN.test(String(args.date ?? "")) ||
+          args.allDates === true;
+        if (!hasFilter) {
+          return {
+            ok: false,
+            summary: "为避免误删，请说明要删除的食物名称、餐次、日期或记录 ID；清空全部请明确说 allDates。",
+          };
+        }
+        const targets = findNutritionForDelete(app, args);
+        if (!targets.length) {
+          return { ok: false, summary: "未找到匹配的饮食记录，可换个食物名或给出日期再试。" };
+        }
+        const lines: string[] = [];
+        for (const target of targets) {
+          await app.deleteNutritionEntry(target.date, target.item.id);
+          lines.push(`· ${target.date} ${summarizeNutritionLogItem(target.item)}`);
+        }
+        return {
+          ok: true,
+          summary: `已删除 ${lines.length} 条饮食记录：\n${lines.join("\n")}`,
+        };
+      }
+
+      case "update_nutrition": {
+        const found = findNutritionForUpdate(app, args);
+        if (!found) {
+          return { ok: false, summary: "未找到要修改的饮食记录，请给出食物名称、日期或记录 ID。" };
+        }
+        const patch: Partial<NutritionLogItem> = {};
+        const macroKeys = ["calories", "carbs", "protein", "fats"];
+        if (hasArg(args, "quantity")) {
+          const quantity = Number(args.quantity);
+          if (Number.isFinite(quantity) && quantity > 0) {
+            patch.quantity = quantity;
+            // 只改克数 + scaleMacros：按原记录自身的份量/营养折算，而不是食物库每100g。
+            if (args.scaleMacros === true && !macroKeys.some((key) => hasArg(args, key))) {
+              const base = Number(found.item.quantity) || 0;
+              if (base > 0) {
+                const ratio = quantity / base;
+                const r1 = (n: number) => Math.round(n * 10) / 10;
+                patch.calories = Math.round(found.item.calories * ratio);
+                patch.carbs = r1(found.item.carbs * ratio);
+                patch.protein = r1(found.item.protein * ratio);
+                patch.fats = r1(found.item.fats * ratio);
+              }
+            }
+          }
+        }
+        if (hasArg(args, "unit") && ["g", "ml", "serving"].includes(args.unit)) {
+          patch.unit = args.unit;
+        }
+        for (const key of macroKeys) {
+          if (hasArg(args, key)) {
+            const value = Number(args[key]);
+            if (Number.isFinite(value) && value >= 0) {
+              (patch as Record<string, number>)[key] = value;
+            }
+          }
+        }
+        if (NUTRITION_MEAL_TYPES.includes(args.mealType)) patch.mealType = args.mealType;
+        if (hasArg(args, "notes")) patch.notes = String(args.notes).slice(0, 200) || undefined;
+
+        if (!Object.keys(patch).length) {
+          return { ok: false, summary: "没有可更新的字段，请给出新的份量或营养数值。" };
+        }
+        const updated: NutritionLogItem = { ...found.item, ...patch };
+        await app.updateNutritionEntry(found.date, updated);
+        return {
+          ok: true,
+          summary: `已修改饮食记录（${found.date}）：${summarizeNutritionLogItem(updated)}`,
         };
       }
 

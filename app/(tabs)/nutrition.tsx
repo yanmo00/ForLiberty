@@ -9,7 +9,7 @@ import { calculateNutritionRecommendation, getRecommendedFoods, getAllFoods } fr
 import { getCarbCycleDay } from "@/lib/carb-cycle";
 import { getTodayString } from "@/lib/storage";
 import { buildCustomNutritionPlan, formatPlanSummary, macroPercentages } from "@/lib/nutrition-plan";
-import type { NutritionLogItem, FoodLibraryItem, NutritionGoal, FoodCategory, CarbCycleDay, CarbCyclePlan, MealType } from "@/lib/types";
+import type { NutritionLogItem, FoodLibraryItem, NutritionGoal, FoodCategory, CarbCycleDay, CarbCyclePlan, MealType, MealCombo, MealComboItem } from "@/lib/types";
 import { NUTRITION_GOAL_NAMES, CARB_DAY_NAMES, MEAL_TYPE_NAMES } from "@/lib/types";
 import { inferMealType } from "@/lib/nutrition-log";
 
@@ -23,6 +23,9 @@ export default function NutritionScreen() {
     addNutritionEntry,
     updateNutritionEntry,
     deleteNutritionEntry,
+    addMealCombo,
+    updateMealCombo,
+    deleteMealCombo,
     addCustomFood,
     updateCustomFood,
     deleteCustomFood,
@@ -35,6 +38,9 @@ export default function NutritionScreen() {
   const [activeTab, setActiveTab] = useState<"log" | "recommend" | "carb">("log");
   const [isAddingEntry, setIsAddingEntry] = useState(false);
   const [editingItem, setEditingItem] = useState<NutritionLogItem | null>(null);
+  // 编辑记录时改克数，是否按「原记录份量 → 新份量」的比例同步热量/宏量。
+  // 很多人导入的不是 100g，按每 100g 食物库重算会和当时的记录对不上，默认按比例。
+  const [scaleByRatio, setScaleByRatio] = useState(true);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedFood, setSelectedFood] = useState<(FoodLibraryItem & { source: "database" | "custom" }) | null>(null);
@@ -49,6 +55,15 @@ export default function NutritionScreen() {
   const [entryUnit, setEntryUnit] = useState<"g" | "ml" | "serving">("g");
   const [entryNotes, setEntryNotes] = useState("");
   const [date] = useState(getTodayString());
+
+  // 饮食套餐：把固定吃的一套食物存成模板，点一下整套餐记进今天。
+  const [showComboModal, setShowComboModal] = useState(false);
+  const [comboName, setComboName] = useState("");
+  const [comboItems, setComboItems] = useState<MealComboItem[]>([]);
+  const [editingCombo, setEditingCombo] = useState<MealCombo | null>(null);
+  const [comboSearch, setComboSearch] = useState("");
+  const [comboDraftFood, setComboDraftFood] = useState<(FoodLibraryItem & { source: "database" | "custom" }) | null>(null);
+  const [comboDraftQty, setComboDraftQty] = useState("100");
 
   const [showCustomFoodModal, setShowCustomFoodModal] = useState(false);
   const [customFoodName, setCustomFoodName] = useState("");
@@ -162,6 +177,12 @@ export default function NutritionScreen() {
       return matchesQuery && matchesCategory;
     });
   }, [foodLibrary, searchQuery, selectedCategory]);
+
+  const comboFilteredFoods = useMemo(() => {
+    const query = comboSearch.trim().toLowerCase();
+    if (!query) return [];
+    return foodLibrary.filter((food) => food.name.toLowerCase().includes(query)).slice(0, 30);
+  }, [foodLibrary, comboSearch]);
 
   const handleSelectFood = (food: FoodLibraryItem & { source: "database" | "custom" }) => {
     setSelectedFood(food);
@@ -323,6 +344,176 @@ export default function NutritionScreen() {
     const isFavorite = favorites.includes(foodId);
     const next = isFavorite ? favorites.filter((id) => id !== foodId) : [...favorites, foodId];
     await updateUserProfile({ favoriteFoodIds: next });
+  };
+
+  // 改克数时按「原记录克数 → 新克数」的比例同步营养数据。
+  // 只在编辑已有记录时生效（新增时由食物库每 100g 数据负责折算）。
+  const handleQuantityChange = (value: string, forceScale = false) => {
+    setQuantity(value);
+    if (!editingItem || (!scaleByRatio && !forceScale)) return;
+    const base = Number(editingItem.quantity) || 0;
+    const next = parseFloat(value);
+    if (base <= 0 || !Number.isFinite(next) || next <= 0) return;
+    const ratio = next / base;
+    const r1 = (n: number) => Math.round(n * 10) / 10;
+    setCalories(String(Math.round(editingItem.calories * ratio)));
+    setProtein(String(r1(editingItem.protein * ratio)));
+    setCarbs(String(r1(editingItem.carbs * ratio)));
+    setFats(String(r1(editingItem.fats * ratio)));
+  };
+
+  // ── 饮食套餐 ──────────────────────────────────────────────
+  const resetComboEditor = () => {
+    setComboName("");
+    setComboItems([]);
+    setEditingCombo(null);
+    setComboSearch("");
+    setComboDraftFood(null);
+    setComboDraftQty("100");
+  };
+
+  const handleOpenComboEditor = (combo?: MealCombo) => {
+    if (combo) {
+      setEditingCombo(combo);
+      setComboName(combo.name);
+      setComboItems(combo.items.map((item) => ({ ...item })));
+    } else {
+      resetComboEditor();
+    }
+    setComboSearch("");
+    setComboDraftFood(null);
+    setComboDraftQty("100");
+    setShowComboModal(true);
+  };
+
+  // 最省事的建套餐方式：今天已经记过的那几样，一键变成套餐。
+  const handleImportTodayAsCombo = () => {
+    const items: MealComboItem[] = (todayEntry?.items || []).map((i) => ({
+      foodId: i.foodId,
+      name: i.name,
+      quantity: i.quantity,
+      unit: i.unit,
+      calories: i.calories,
+      carbs: i.carbs,
+      protein: i.protein,
+      fats: i.fats,
+      source: i.source,
+      mealType: i.mealType,
+      notes: i.notes,
+    }));
+    if (!items.length) {
+      Alert.alert("提示", "今天还没有饮食记录。先记几样想固定吃的食物，再导入；也可以手动添加食物。");
+      return;
+    }
+    setComboItems(items);
+    if (!comboName.trim()) setComboName(`常吃套餐 ${getTodayString().slice(5)}`);
+  };
+
+  const handleAddComboDraftItem = () => {
+    if (!comboDraftFood) {
+      Alert.alert("提示", "请先从搜索结果里选一个食物");
+      return;
+    }
+    const qty = parseFloat(comboDraftQty) || 0;
+    if (qty <= 0) {
+      Alert.alert("提示", "请输入有效份量（克）");
+      return;
+    }
+    const ratio = qty / 100;
+    const r1 = (n: number) => Math.round(n * 10) / 10;
+    setComboItems((prev) => [
+      ...prev,
+      {
+        foodId: comboDraftFood.id,
+        name: comboDraftFood.name,
+        quantity: qty,
+        unit: "g",
+        calories: Math.round(comboDraftFood.caloriesPer100g * ratio),
+        carbs: r1(comboDraftFood.carbsPer100g * ratio),
+        protein: r1(comboDraftFood.proteinPer100g * ratio),
+        fats: r1(comboDraftFood.fatsPer100g * ratio),
+        source: comboDraftFood.source,
+        mealType: entryMealType,
+      },
+    ]);
+    setComboDraftFood(null);
+    setComboSearch("");
+    setComboDraftQty("100");
+  };
+
+  const handleSaveCombo = async () => {
+    const name = comboName.trim();
+    if (!name) {
+      Alert.alert("提示", "请输入套餐名称");
+      return;
+    }
+    if (!comboItems.length) {
+      Alert.alert("提示", "套餐里至少要有一样食物");
+      return;
+    }
+    try {
+      if (editingCombo) {
+        await updateMealCombo({ ...editingCombo, name, items: comboItems, updatedAt: new Date().toISOString() });
+      } else {
+        await addMealCombo({ name, items: comboItems });
+      }
+      setShowComboModal(false);
+      resetComboEditor();
+      Alert.alert("成功", "套餐已保存");
+    } catch {
+      Alert.alert("错误", "保存套餐失败");
+    }
+  };
+
+  const handleDeleteCombo = (combo: MealCombo) => {
+    Alert.alert("删除套餐", `确定删除「${combo.name}」吗？已有饮食记录不会受影响。`, [
+      { text: "取消", style: "cancel" },
+      {
+        text: "删除",
+        style: "destructive",
+        onPress: async () => {
+          await deleteMealCombo(combo.id);
+          setShowComboModal(false);
+          resetComboEditor();
+        },
+      },
+    ]);
+  };
+
+  const handleApplyCombo = (combo: MealCombo) => {
+    if (!combo.items.length) {
+      Alert.alert("提示", "这个套餐还没有食物");
+      return;
+    }
+    Alert.alert("添加套餐", `把「${combo.name}」的 ${combo.items.length} 项食物记录到今天？`, [
+      { text: "取消", style: "cancel" },
+      {
+        text: "添加",
+        onPress: async () => {
+          try {
+            for (const item of combo.items) {
+              await addNutritionEntry({
+                date,
+                foodId: item.foodId,
+                name: item.name,
+                quantity: item.quantity,
+                unit: item.unit,
+                calories: item.calories,
+                carbs: item.carbs,
+                protein: item.protein,
+                fats: item.fats,
+                source: item.source ?? "quick",
+                mealType: item.mealType ?? inferMealType(),
+                notes: item.notes,
+              });
+            }
+            Alert.alert("成功", `已添加套餐「${combo.name}」共 ${combo.items.length} 项`);
+          } catch {
+            Alert.alert("错误", "添加套餐失败");
+          }
+        },
+      },
+    ]);
   };
 
   const handleSaveCustomFood = async () => {
@@ -542,6 +733,43 @@ export default function NutritionScreen() {
             </View>
           </View>
 
+          {/* 饮食套餐：固定吃的那几样，一键整套餐记录 */}
+          <View className="px-5 py-4">
+            <View className="flex-row items-center justify-between mb-2">
+              <Text className="text-foreground font-semibold">饮食套餐</Text>
+              <TouchableOpacity onPress={() => handleOpenComboEditor()} activeOpacity={0.7}>
+                <Text className="text-primary text-xs">＋ 新建套餐</Text>
+              </TouchableOpacity>
+            </View>
+            {state.mealCombos.length > 0 ? (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                {state.mealCombos.map((combo) => {
+                  const comboCalories = Math.round(
+                    combo.items.reduce((sum, i) => sum + (Number(i.calories) || 0), 0)
+                  );
+                  return (
+                    <TouchableOpacity
+                      key={combo.id}
+                      onPress={() => handleApplyCombo(combo)}
+                      onLongPress={() => handleOpenComboEditor(combo)}
+                      className="bg-primary/10 px-3 py-2 rounded-lg border border-primary/30 mr-2"
+                      activeOpacity={0.7}
+                    >
+                      <Text className="text-foreground text-sm font-medium">{combo.name}</Text>
+                      <Text className="text-muted text-xs mt-0.5">
+                        {combo.items.length} 项 · {comboCalories} kcal
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            ) : (
+              <Text className="text-muted text-xs">
+                把常吃的一套食物存成套餐，点一下就能整套餐记到当天（长按套餐可编辑）。
+              </Text>
+            )}
+          </View>
+
           {/* 常用食物 */}
           {favoriteFoods.length > 0 && (
             <View className="px-5 py-4">
@@ -678,7 +906,7 @@ export default function NutritionScreen() {
               <View className="flex-row gap-2 mb-3">
                 <TextInput
                   value={quantity}
-                  onChangeText={setQuantity}
+                  onChangeText={handleQuantityChange}
                   placeholder="克数"
                   keyboardType="decimal-pad"
                   placeholderTextColor={colors.muted}
@@ -693,6 +921,29 @@ export default function NutritionScreen() {
                   className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
                 />
               </View>
+              {/* 编辑记录时才出现：改克数时按原记录比例同步热量/宏量 */}
+              {editingItem && (
+                <TouchableOpacity
+                  onPress={() => {
+                    const next = !scaleByRatio;
+                    setScaleByRatio(next);
+                    // 重新打开开关时立刻按当前克数重算一次（此时闭包里的 scaleByRatio 还是旧值）
+                    if (next) handleQuantityChange(quantity, true);
+                  }}
+                  className="flex-row items-center bg-primary/5 rounded-lg px-3 py-2 mb-3 border border-border"
+                  activeOpacity={0.7}
+                >
+                  <View className={`w-5 h-5 rounded items-center justify-center mr-2 ${scaleByRatio ? "bg-primary" : "bg-background border border-border"}`}>
+                    {scaleByRatio ? <Text className="text-background text-xs font-bold">✓</Text> : null}
+                  </View>
+                  <View className="flex-1">
+                    <Text className="text-foreground text-sm">按原记录比例调整营养数据</Text>
+                    <Text className="text-muted text-xs mt-0.5">
+                      原 {editingItem.quantity}{editingItem.unit === "serving" ? "份" : editingItem.unit || "g"} · {editingItem.calories} kcal · 蛋白 {editingItem.protein}g / 碳水 {editingItem.carbs}g / 脂肪 {editingItem.fats}g
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              )}
               <View className="flex-row gap-2 mb-3">
                 <TextInput
                   value={protein}
@@ -767,6 +1018,7 @@ export default function NutritionScreen() {
               <TouchableOpacity
                 onPress={() => {
                   setEditingItem(item);
+                  setScaleByRatio(true);
                   setSelectedFood(null);
                   setFoodName(item.name);
                   setQuantity(String(item.quantity));
@@ -1160,6 +1412,121 @@ export default function NutritionScreen() {
           </View>
         </ScrollView>
       )}
+
+      {/* 饮食套餐编辑弹窗 */}
+      <Modal visible={showComboModal} animationType="slide" presentationStyle="pageSheet">
+        <ScreenContainer className="flex-1">
+          <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
+            <TouchableOpacity onPress={() => { setShowComboModal(false); resetComboEditor(); }}>
+              <Text className="text-primary">取消</Text>
+            </TouchableOpacity>
+            <Text className="text-lg font-semibold text-foreground">{editingCombo ? "编辑套餐" : "新建套餐"}</Text>
+            <TouchableOpacity onPress={handleSaveCombo}>
+              <Text className="text-primary font-semibold">保存</Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView className="flex-1" contentContainerStyle={{ padding: 20 }}>
+            <Text className="text-muted text-xs mb-2">
+              把固定会吃的食物存成一套，之后在饮食记录页点套餐名就能一次全记进去。
+            </Text>
+            <TextInput
+              value={comboName}
+              onChangeText={setComboName}
+              placeholder="套餐名称，如 早餐固定搭配"
+              placeholderTextColor={colors.muted}
+              className="bg-surface rounded-lg px-4 py-3 text-foreground border border-border mb-3"
+            />
+            <TouchableOpacity
+              onPress={handleImportTodayAsCombo}
+              className="bg-primary/10 rounded-lg py-3 items-center mb-5 border border-border"
+              activeOpacity={0.8}
+            >
+              <Text className="text-primary font-medium">从今日记录导入（把今天吃的存成套餐）</Text>
+            </TouchableOpacity>
+
+            <Text className="text-foreground font-semibold mb-2">套餐内容（{comboItems.length} 项）</Text>
+            {comboItems.length > 0 ? (
+              <View className="mb-5">
+                {comboItems.map((item, index) => (
+                  <View key={`${item.name}-${index}`} className="flex-row items-center bg-surface rounded-lg px-3 py-2 mb-2 border border-border">
+                    <View className="flex-1">
+                      <Text className="text-foreground">{item.name}</Text>
+                      <Text className="text-muted text-xs mt-0.5">
+                        {item.quantity}{item.unit === "serving" ? "份" : item.unit} · {item.calories} kcal · 蛋白 {item.protein}g / 碳水 {item.carbs}g / 脂肪 {item.fats}g
+                      </Text>
+                    </View>
+                    <TouchableOpacity
+                      onPress={() => setComboItems((prev) => prev.filter((_, i) => i !== index))}
+                      className="ml-2 px-2 py-1"
+                    >
+                      <Text className="text-error">移除</Text>
+                    </TouchableOpacity>
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <Text className="text-muted text-xs mb-5">还没有食物，可以从今天记录导入，或在下面搜索添加。</Text>
+            )}
+
+            <Text className="text-foreground font-semibold mb-2">添加食物</Text>
+            <TextInput
+              value={comboSearch}
+              onChangeText={(text) => { setComboSearch(text); setComboDraftFood(null); }}
+              placeholder="搜索食物名..."
+              placeholderTextColor={colors.muted}
+              className="bg-surface rounded-lg px-4 py-3 text-foreground border border-border mb-2"
+            />
+            {comboDraftFood ? (
+              <View className="bg-primary/5 rounded-lg p-3 mb-4 border border-border">
+                <Text className="text-foreground font-medium mb-2">已选：{comboDraftFood.name}（每 100g {comboDraftFood.caloriesPer100g} kcal）</Text>
+                <View className="flex-row gap-2">
+                  <TextInput
+                    value={comboDraftQty}
+                    onChangeText={setComboDraftQty}
+                    placeholder="克数"
+                    keyboardType="decimal-pad"
+                    placeholderTextColor={colors.muted}
+                    className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
+                  />
+                  <TouchableOpacity
+                    onPress={handleAddComboDraftItem}
+                    className="bg-primary rounded-lg px-5 items-center justify-center"
+                    activeOpacity={0.8}
+                  >
+                    <Text className="text-background font-semibold">加入套餐</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : comboFilteredFoods.length > 0 ? (
+              <View className="mb-4">
+                {comboFilteredFoods.map((food) => (
+                  <TouchableOpacity
+                    key={food.id}
+                    onPress={() => setComboDraftFood(food)}
+                    className="py-2 border-b border-border"
+                    activeOpacity={0.7}
+                  >
+                    <Text className="text-foreground">
+                      {food.name} · {food.caloriesPer100g} kcal/100g
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            ) : null}
+
+            {editingCombo && (
+              <TouchableOpacity
+                onPress={() => handleDeleteCombo(editingCombo)}
+                className="mt-2 bg-error/10 rounded-lg py-3 items-center"
+                activeOpacity={0.8}
+              >
+                <Text className="text-error">删除这个套餐</Text>
+              </TouchableOpacity>
+            )}
+          </ScrollView>
+        </ScreenContainer>
+      </Modal>
 
       {/* 自定义食物弹窗 */}
       <Modal visible={showCustomFoodModal} animationType="slide" presentationStyle="pageSheet">
