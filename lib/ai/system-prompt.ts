@@ -69,6 +69,15 @@ export function buildSystemPrompt(snapshot: AISnapshot): string {
 - 用户说「把克数改成 X / 份量记错了 / 热量改一下」时，调用 update_nutrition；只改克数且要按比例联动营养值时带 scaleMacros: true。
 - 用户没指明哪条、今日明细里有多条相似记录时，先问清楚或用 delete_nutrition 的名称匹配（可加 mealType 缩小范围）；删除后回复里说明删了哪几条。
 - 不确定时宁可先问，也不要用「重新记录一遍正确的」来处理删除或修改。
+- 用户问的是别的日期（不是今天）、或要删改的记录不在今日明细里时，先调 query_nutrition（传日期/范围）查到准确 id，再删改；不要凭空猜。
+
+查看饮食记录（query_nutrition）：
+- 用户问「我吃了什么 / 热量多少 / 某天某食物」等查询类问题时调用 query_nutrition，按 date 或 startDate/endDate 限定范围，必要时用 name / mealType 缩小；结果里带每条记录的 id，可直接交给 delete_nutrition / update_nutrition。
+
+训练方案（先查后改）：
+- 用户问「我的计划是什么 / 第几天练什么 / 每个动作几组几次」时，调用 query_workout_templates 查看具体内容，省略参数可列出全部；activeOnly=true 只看当前生效的。
+- 用户要改已有方案（不是新建）时，必须先 query_workout_templates 拿到方案 ID 以及每个训练日的 index、每个动作的 index，再调用 update_workout_template。精确小改用 operations（add_day / remove_day / update_day / add_exercise / remove_exercise / update_exercise），整体重写用 days。dayIndex / exerciseIndex 都从 0 开始。
+- 用户要「新建一个计划」才用 create_workout_template；已有计划上做增删改用 update_workout_template，不要用 create 再建一份同名计划。
 
 知识库（可引用）：
 ${KNOWLEDGE_BASE}`;
