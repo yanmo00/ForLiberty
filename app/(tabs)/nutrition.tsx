@@ -792,11 +792,10 @@ export default function NutritionScreen() {
             </View>
           )}
 
-          {/* 添加记录表单 */}
-          {isAddingEntry && (
-            <View className="px-5 py-4 border-b border-border bg-surface">
-              <View className="flex-row items-center justify-between mb-4">
-                <Text className="text-foreground font-semibold">{editingItem ? "编辑记录" : "添加记录"}</Text>
+          {/* 添加/编辑记录弹窗：独立全屏 Modal，避免表单下半部被底部 TabBar 遮挡 */}
+          <Modal visible={isAddingEntry} animationType="slide" presentationStyle="pageSheet">
+            <ScreenContainer className="flex-1">
+              <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
                 <TouchableOpacity onPress={() => {
                   setIsAddingEntry(false);
                   setEditingItem(null);
@@ -808,9 +807,15 @@ export default function NutritionScreen() {
                   setCarbs("");
                   setFats("");
                 }}>
-                  <IconSymbol name="xmark" size={20} color={colors.muted} />
+                  <Text className="text-primary">取消</Text>
+                </TouchableOpacity>
+                <Text className="text-lg font-semibold text-foreground">{editingItem ? "编辑记录" : "添加记录"}</Text>
+                <TouchableOpacity onPress={handleAddEntry}>
+                  <Text className="text-primary font-semibold">保存</Text>
                 </TouchableOpacity>
               </View>
+
+              <ScrollView className="flex-1" contentContainerStyle={{ padding: 20 }}>
 
               {/* 食物搜索 */}
               <View className="mb-3">
@@ -986,11 +991,9 @@ export default function NutritionScreen() {
                   <Text className="text-foreground">添加自定义食物</Text>
                 </TouchableOpacity>
               </View>
-              <TouchableOpacity onPress={handleAddEntry} className="bg-primary rounded-lg py-2 items-center">
-                <Text className="text-background font-semibold">保存</Text>
-              </TouchableOpacity>
-            </View>
-          )}
+            </ScrollView>
+            </ScreenContainer>
+          </Modal>
 
           {/* 记录列表：早 / 中 / 晚三段分开，各自带小计 */}
           <SectionList
