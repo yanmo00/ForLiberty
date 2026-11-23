@@ -234,19 +234,19 @@ export default function CalendarScreen() {
               </View>
               <View className="flex-row justify-between">
                 <View className="items-center">
-                  <Text className="text-foreground font-semibold">{selectedDayData.nutrition.totalCalories}</Text>
+                  <Text className="text-foreground font-semibold">{Number(selectedDayData.nutrition.totalCalories || 0).toFixed(1)}</Text>
                   <Text className="text-muted text-sm">热量</Text>
                 </View>
                 <View className="items-center">
-                  <Text className="text-foreground font-semibold">{selectedDayData.nutrition.totalProtein}g</Text>
+                  <Text className="text-foreground font-semibold">{Number(selectedDayData.nutrition.totalProtein || 0).toFixed(1)}g</Text>
                   <Text className="text-muted text-sm">蛋白质</Text>
                 </View>
                 <View className="items-center">
-                  <Text className="text-foreground font-semibold">{selectedDayData.nutrition.totalCarbs}g</Text>
+                  <Text className="text-foreground font-semibold">{Number(selectedDayData.nutrition.totalCarbs || 0).toFixed(1)}g</Text>
                   <Text className="text-muted text-sm">碳水</Text>
                 </View>
                 <View className="items-center">
-                  <Text className="text-foreground font-semibold">{selectedDayData.nutrition.totalFats}g</Text>
+                  <Text className="text-foreground font-semibold">{Number(selectedDayData.nutrition.totalFats || 0).toFixed(1)}g</Text>
                   <Text className="text-muted text-sm">脂肪</Text>
                 </View>
               </View>
