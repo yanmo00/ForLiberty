@@ -126,6 +126,10 @@ export default function RootLayout() {
               options={{ presentation: 'card' }} 
             />
             <Stack.Screen 
+              name="profile/trends" 
+              options={{ presentation: 'card' }} 
+            />
+            <Stack.Screen 
               name="nutrition/recommend" 
               options={{ presentation: 'card' }} 
             />

@@ -3,6 +3,7 @@ import { Text, View, TouchableOpacity, TextInput, FlatList, Alert } from "react-
 import { useRouter } from "expo-router";
 import { ScreenContainer } from "@/components/screen-container";
 import { IconSymbol } from "@/components/ui/icon-symbol";
+import { TrendChart, type TrendPoint } from "@/components/trend-chart";
 import { useColors } from "@/hooks/use-colors";
 import { useApp } from "@/lib/app-context";
 import { getTodayString } from "@/lib/storage";
@@ -133,6 +134,19 @@ export default function BodyMetricsScreen() {
   };
 
   const trend = getTrend();
+
+  // 趋势图数据：按日期升序（旧 → 新），只取有值的记录
+  const buildSeries = (field: "weight" | "bodyFat"): TrendPoint[] =>
+    [...state.bodyMetrics]
+      .filter((m) => Number.isFinite(m[field]))
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map((m) => ({
+        label: m.date.slice(5).replace("-", "/"),
+        value: m[field] as number,
+      }));
+
+  const weightSeries = buildSeries("weight");
+  const bodyFatSeries = buildSeries("bodyFat");
 
   const renderMetricItem = ({ item }: { item: BodyMetricEntry }) => (
     <TouchableOpacity
@@ -293,7 +307,22 @@ export default function BodyMetricsScreen() {
         }
         ListHeaderComponent={
           sortedMetrics.length > 0 ? (
-            <Text className="text-foreground font-semibold mb-3">历史记录</Text>
+            <View>
+              {!isAdding && (
+                <View className="mb-5">
+                  <Text className="text-foreground font-semibold mb-3">体重趋势</Text>
+                  <TrendChart data={weightSeries} color={colors.primary} unit="kg" height={170} />
+                </View>
+              )}
+              {!isAdding && bodyFatSeries.length > 0 && (
+                <View className="mb-5">
+                  <Text className="text-foreground font-semibold mb-3">体脂率趋势</Text>
+                  <TrendChart data={bodyFatSeries} color={colors.warning} unit="%" height={170}
+                    formatValue={(v) => `${Math.round(v * 10) / 10}%`} />
+                </View>
+              )}
+              <Text className="text-foreground font-semibold mb-3">历史记录</Text>
+            </View>
           ) : null
         }
       />

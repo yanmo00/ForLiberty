@@ -7,6 +7,7 @@ import { useColors } from "@/hooks/use-colors";
 import { ExercisePicker } from "@/components/exercise-picker";
 import { useApp } from "@/lib/app-context";
 import { getCurrentTimeString } from "@/lib/storage";
+import { getLastSetsForExercise } from "@/lib/workout-history";
 import type { WorkoutSet, Exercise } from "@/lib/types";
 import { MUSCLE_GROUP_NAMES } from "@/lib/types";
 import { DEFAULT_REPS } from "@/constants/workout-defaults";
@@ -102,12 +103,23 @@ export default function WorkoutSessionScreen() {
     if (planned?.restSeconds) {
       setTargetRestSeconds(planned.restSeconds);
     }
-    if (planned?.weight) {
-      setWeight(String(planned.weight));
-    }
-    // 计划动作的次数优先；没有计划时用统一默认值 12。
-    setReps(String(planned?.reps ?? DEFAULT_REPS));
-  }, [selectedExercise, state.currentSession?.plan?.exercises]);
+    // 默认值优先级：本次会话该动作已记录的最后一组 → 上次训练该动作的首个正式组
+    // → 计划值 → 统一默认值。这样进入动作时第一组就带出最近一次的数据。
+    const currentSets = state.currentSession?.sets
+      .filter((s) => s.exerciseId === selectedExercise.id)
+      .sort((a, b) => a.setIndex - b.setIndex) ?? [];
+    const lastSets = getLastSetsForExercise(state.workoutSessions, selectedExercise.id);
+    const referenceSet = currentSets[currentSets.length - 1] ?? lastSets[0];
+
+    const defaultWeight = referenceSet?.weight ?? planned?.weight;
+    if (defaultWeight !== undefined) setWeight(String(defaultWeight));
+    setReps(String(referenceSet?.reps ?? planned?.reps ?? DEFAULT_REPS));
+  }, [
+    selectedExercise,
+    state.currentSession?.plan?.exercises,
+    state.currentSession?.sets,
+    state.workoutSessions,
+  ]);
 
   const formatTime = (seconds: number): string => {
     const mins = Math.floor(seconds / 60);
@@ -167,11 +179,10 @@ export default function WorkoutSessionScreen() {
 
     addSetToSession(newSet);
     
-    // 重置输入但保留重量（通常下一组重量相同）；次数回到计划值或统一默认值
-    const plannedReps = state.currentSession?.plan?.exercises?.find(
-      (ex) => ex.exerciseId === selectedExercise.id
-    )?.reps;
-    setReps(String(plannedReps ?? DEFAULT_REPS));
+    // 下一组沿用刚完成的这一组（重量 + 次数），符合「第二组第三组用前一组数据」。
+    // weight/reps 输入框本就保留用户输入，这里显式写回刚保存的数值，避免计划值覆盖。
+    setWeight(String(weightNum));
+    setReps(String(repsNum));
     setIsWarmup(false);
     
     // 开始休息计时

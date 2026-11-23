@@ -91,6 +91,12 @@ export default function ProfileScreen() {
       route: "/profile/body-metrics",
     },
     {
+      title: "重量趋势",
+      icon: "chart.line.uptrend.xyaxis" as const,
+      subtitle: "体重、体脂及各动作重量走势",
+      route: "/profile/trends",
+    },
+    {
       title: "AI 助手",
       icon: "brain" as const,
       subtitle: state.aiConfig.isConfigured ? "已配置" : "配置 API Key 开始使用",
