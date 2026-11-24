@@ -69,6 +69,8 @@ const config: ExpoConfig = {
     // 允许 http:// 自建/局域网/EasyTier 网关（Android release 默认禁明文）
     "./plugins/with-cleartext-traffic",
     "expo-router",
+    // AI 在后台生成完成后发本地通知提醒用户
+    "expo-notifications",
     [
       "expo-image-picker",
       {

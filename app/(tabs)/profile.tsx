@@ -117,9 +117,11 @@ export default function ProfileScreen() {
         contentContainerStyle={{ paddingBottom: 100 }}
         showsVerticalScrollIndicator={false}
       >
-        {/* 头部 */}
-        <View className="px-5 pt-4 pb-6">
-          <Text className="text-3xl font-bold text-foreground">我的</Text>
+        {/* 头部：与训练/饮食/日历页统一的圆角色块 */}
+        <View className="px-5 pt-6 pb-6 bg-primary/5 rounded-b-[28px]">
+          <Text className="text-xs tracking-[2px] text-muted">FITLIFE</Text>
+          <Text className="text-3xl font-semibold text-foreground mt-2">我的</Text>
+          <Text className="text-base text-muted mt-1">数据与设置</Text>
         </View>
 
         {/* 用户信息卡片 */}

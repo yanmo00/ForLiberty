@@ -277,10 +277,13 @@ export interface AIConfig {
 }
 
 // 聊天消息里附带的图片元信息。
-// 不存 base64：图片本体只放在当次会话的内存里，避免 AsyncStorage 被大图撑爆。
+// 不把 base64 写进 AsyncStorage（大图会撑爆存储）：发送时把图片落到 App 文档目录，
+// 这里只存一个本地文件 uri；老消息可能没有 uri（只有元信息），渲染时显示占位图。
 export interface AIMessageImage {
   name?: string;
   mimeType: string;
+  /** 持久化后的本地文件 uri（file://），跨页面/重启仍可显示 */
+  uri?: string;
 }
 
 // AI消息

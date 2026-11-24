@@ -456,6 +456,13 @@ export interface AppContextType {
 // 创建Context
 const AppContext = createContext<AppContextType | null>(null);
 
+// 供模块级服务（AI 生成引擎）读取「最新」context。页面卸载后闭包里的 app 会过期，
+// 这个引用每次渲染都会更新，后台生成时调用工具能拿到最新 state 和稳定方法。
+let liveApp: AppContextType | null = null;
+export function getLiveApp(): AppContextType | null {
+  return liveApp;
+}
+
 // Provider组件
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState);
@@ -986,6 +993,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     getNutritionByDate,
     getBodyMetricByDate,
   };
+
+  liveApp = value;
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

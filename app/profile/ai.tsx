@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { useState, useRef, useEffect, useMemo, useSyncExternalStore, useCallback } from "react";
 import {
   Text,
   View,
@@ -25,9 +25,14 @@ import { useKeyboardOverlap } from "@/hooks/use-keyboard-overlap";
 import { useApp } from "@/lib/app-context";
 import type { AIMessage, AIConfig } from "@/lib/types";
 import Markdown from "react-native-markdown-display";
-import { buildAISnapshot } from "@/lib/ai/data-model";
-import { buildSystemPrompt } from "@/lib/ai/system-prompt";
-import { AI_TOOLS, executeToolCall, type ToolResult } from "@/lib/ai/tools";
+import {
+  runGeneration,
+  subscribeJob,
+  getJobSnapshot,
+  clearJobResult,
+  type ToolActionEntry,
+} from "@/lib/ai/chat-engine";
+import { persistChatImages, deleteChatImages, toDataUriForRecognition } from "@/lib/ai/chat-images";
 import {
   buildCustomNutritionPlan,
   parseNutritionPlanFromText,
@@ -162,19 +167,6 @@ function describeReasoningError(msg: string): string | null {
   );
 }
 
-// 判断「整段回复是在拒绝识别图片」，而不是句子里恰好出现否定词。
-// 反例：正常识别结果里常有「因无法直接读取包装背面的营养成分表，故按常见品类估算」，
-// 旧版用 /无法读取/ 直接匹配会把这类有效结果误判成失败，表现就是「时灵时不灵」。
-function isVisionRefusal(text: string): boolean {
-  const t = text.trim();
-  if (!t || t.length > 180) return false;
-  // 只要写了实质内容（食物、热量、数值、清单），就不算拒答
-  if (/图中可见|图片中|识别结果|可记录数据|kcal|热量|蛋白|碳水|脂肪|食物|体重|体脂|动作|组数|\d+\s*g/i.test(t)) return false;
-  return /看不到(这张)?(图片|图)|无法(查看|看到|读取|访问|识别)(这张)?(图片|图)|读不到图片|没有收到图片|未提供图片|不支持图片|无法访问图片|cannot (see|view|access) (the )?image|no image (was )?(provided|received)|unable to (see|view|process) (the )?image/i.test(t);
-}
-
-const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 // 分诊：以前任何网络失败都甩「浏览器跨域/代理没启动」，真机断网也这么报，纯属误导。
 async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<string> {
   const reasoning = describeReasoningError(msg);
@@ -280,10 +272,12 @@ export default function AIScreen() {
   const app = useApp();
   const { state, updateAIConfig, addAIMessage, updateAIMessage, setAIMessages, updateUserProfile } = app;
   const flatListRef = useRef<FlatList>(null);
-  // 图片本体只存内存：按消息 id 存一组 data URI，避免大 base64 撑爆 AsyncStorage。
+  // 图片本体落盘在文档目录，消息里存 file:// uri；内存 ref 只作刚发送时的即时预览。
   const imagePreviews = useRef<Record<string, string[]>>({});
-  // 最新消息镜像：构建模型上下文时不再依赖渲染闭包里的旧 state。
-  const messagesRef = useRef<AIMessage[]>(state.aiMessages);
+  // 生成引擎的状态放在模块级，页面卸载也不丢；回到页面靠 useSyncExternalStore 立即同步。
+  const job = useSyncExternalStore(subscribeJob, getJobSnapshot, getJobSnapshot);
+  const isLoading = job.running;
+  const toolActions: ToolActionEntry[] = job.toolActions;
 
   // 配置状态
   const [showConfig, setShowConfig] = useState(!state.aiConfig.isConfigured);
@@ -307,12 +301,11 @@ export default function AIScreen() {
 
   // 对话状态
   const [inputText, setInputText] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   // 长按气泡进入「选择文字」浮层：里面是纯文本，保证任何平台都能长按拖选片段。
   const [selectionTarget, setSelectionTarget] = useState<AIMessage | null>(null);
-  // AI 本次对话实际执行的写操作（透明展示，不进持久聊天记录，保持模型上下文干净）
-  const [toolActions, setToolActions] = useState<{ name: string; args: any; result: ToolResult }[]>([]);
+  // 点气泡才展开操作行，默认收起，聊天区更干净。
+  const [expandedActions, setExpandedActions] = useState<string | null>(null);
   // 归档：主列表只显示未归档消息；归档内容仍留在本机，可在归档箱里删除/恢复。
   const [showArchive, setShowArchive] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
@@ -340,9 +333,15 @@ export default function AIScreen() {
   // Web 预览时本机代理是否在线：一眼能看出「请求失败」是不是代理没起导致的
   const [proxyAlive, setProxyAlive] = useState<boolean | null>(null);
 
+  // 从持久化的消息里恢复图片预览 uri。这样重进页面 / 重启 App 后图片仍能显示，
+  // 而不是只剩灰色占位图（旧消息只有元信息、没有 uri 时依旧显示占位）。
   useEffect(() => {
-    // 归档的历史不进模型上下文：否则归档只是藏起来，token 还是照烧。
-    messagesRef.current = state.aiMessages.filter((m) => !m.archived);
+    for (const m of state.aiMessages) {
+      const saved = [...(m.images ?? []), ...(m.image ? [m.image] : [])]
+        .map((img) => img.uri)
+        .filter((u): u is string => !!u);
+      if (saved.length && !imagePreviews.current[m.id]) imagePreviews.current[m.id] = saved;
+    }
   }, [state.aiMessages]);
 
   useEffect(() => {
@@ -486,8 +485,6 @@ export default function AIScreen() {
     }
   };
 
-  const generateSystemPrompt = () => buildSystemPrompt(buildAISnapshot(state));
-
   // 测试API连接：结果写进页面内结果条，Web 上也能看见（Alert 在 Web 是空函数）
   const handleTestConnection = async () => {
     const effectiveKey = apiKey.trim() || state.aiConfig.apiKey || "";
@@ -618,170 +615,10 @@ export default function AIScreen() {
     }
   };
 
-  // 调用聊天补全（带工具）；返回解析后的响应 JSON。withTools=false 时退化为纯对话。
-  const callChat = async (
-    messages: any[],
-    withTools = true,
-    modelOverride?: string,
-    tokenOverride?: number
-  ): Promise<any> => {
-    // 统一取「配置面板当前值」：以前测试连接用输入框、发消息用已保存值，
-    // 用户刚改了自建地址没点保存时就会出现「测试通过、对话却连旧地址」的假象。
-    const configBase = normalizeBaseUrl(baseUrl || state.aiConfig.baseUrl || TOKENHUB_BASE_URL);
-    const effectiveKey = apiKey.trim() || state.aiConfig.apiKey || "";
-    const target = `${resolveBaseUrl(configBase)}/chat/completions`;
-    const configured = Math.min(32768, Math.max(512, Number(maxTokens) || DEFAULT_MAX_TOKENS));
-    const baseTokens = tokenOverride ?? configured;
 
-    // 空正文 / 502 是推理型模型的偶发瞬时故障（Auto 每次可能路由到不同型号）：
-    // 自动重试，逐次加大输出预算并去掉工具 schema 减轻推理负担。
-    // 401/429/404 这类确定性错误立即抛出，不浪费额度。
-    let lastError: Error | null = null;
-    let reasoningFailure = false;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const tokens = reasoningFailure
-        ? Math.min(32768, Math.max(baseTokens, 8192 * attempt))
-        : attempt === 0
-          ? baseTokens
-          : Math.min(32768, Math.max(baseTokens, 4096));
-      const useTools = withTools && toolsEnabled && !reasoningFailure;
-      const body: Record<string, unknown> = {
-        model: modelOverride || model || state.aiConfig.model || TOKENHUB_DEFAULT_MODEL,
-        messages,
-        max_tokens: tokens,
-      };
-      if (useTools) {
-        body.tools = AI_TOOLS;
-        body.tool_choice = "auto";
-      }
-      const response = await fetchWithRetry(
-        target,
-        withProxyHeadersFor(configBase, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${effectiveKey}`,
-          },
-          body: JSON.stringify(body),
-        })
-      );
-      if (!response.ok) {
-        const resBody = await response.text().catch(() => "");
-        let message: string = resBody;
-        try {
-          message = JSON.parse(resBody)?.error?.message || resBody;
-        } catch {
-          // 纯文本错误
-        }
-        const err = new Error(`HTTP ${response.status}：${message || response.statusText}`);
-        const retryable =
-          !!describeReasoningError(message) ||
-          response.status === 502 || response.status === 503 || response.status === 504;
-        if (retryable && attempt < 2) {
-          reasoningFailure = reasoningFailure || !!describeReasoningError(message);
-          lastError = err;
-          await pause(700 * (attempt + 1));
-          continue;
-        }
-        throw err;
-      }
-      const data = await response.json();
-      const msg = data?.choices?.[0]?.message;
-      const hasTools = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
-      // HTTP 200 但正文为空：同样是推理耗尽，加大预算再试一次
-      if (!String(msg?.content ?? "").trim() && !hasTools && attempt < 2) {
-        reasoningFailure = true;
-        lastError = new Error("模型返回了空正文（推理耗尽）");
-        await pause(700 * (attempt + 1));
-        continue;
-      }
-      return data;
-    }
-    throw lastError ?? new Error("请求失败：模型连续多次没有返回正文");
-  };
-
-  // 图片识别：单独一次纯视觉请求（不带工具），拿到的文字作为上下文喂给主对话，
-  // 同时写回该条用户消息的 imageAnalysis 字段，作为可持久化的「识别数据记录」。
-  //
-  // Auto 会把请求路由到不同型号：偶尔落到纯文本/推理型号时，会回一句「我看不到图片」。
-  // 以前这里直接报错、把消息退回输入框让用户手动重发，表现就是「时灵时不灵」。
-  // 现在自动重试 3 次：逐次把 image_url 提前（部分网关对 content 顺序敏感）、
-  // 强化 system 提示、加大输出预算；只有 3 次都失败才把文字+图片退回。
-  const recognizeImages = async (dataUris: string[], question: string): Promise<string> => {
-    // 与 callChat 保持一致：用配置面板当前值，刚填了视觉模型没点保存也能生效。
-    const vision = (visionModel.trim() || state.aiConfig.visionModel || "").trim();
-    // 多图清单输出更长，Auto 又可能路由到推理型型号 → 预算按张数递增。
-    const baseTokens = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192 + (dataUris.length - 1) * 2048);
-    const systemBase =
-      "你是图片识别助手。用中文客观描述图片内容，只写看得清的内容，不要编造数字。" +
-      (dataUris.length > 1
-        ? `本条消息共有 ${dataUris.length} 张图片，请用「图片1：」「图片2：」…分段逐张列出，不要混在一起。`
-        : "") +
-      "若是食物/餐盘：逐项列出食物、估算份量(g)、热量(kcal)与蛋白/碳水/脂肪(g)。" +
-      "若是体脂秤或体测报告：逐项抄录体重、体脂率、BMI、肌肉量等数值与单位。" +
-      "若是训练计划表：列出动作、组数、次数、重量。最后给一行『可记录数据：…』摘要。";
-    let lastReason = "视觉模型没有返回识别结果";
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const imageParts = dataUris.map((uri) => ({ type: "image_url", image_url: { url: uri } }));
-      const textPart = {
-        type: "text",
-        text: question || "请逐张识别这些图片，并把其中可记录的数据逐项列出来。",
-      };
-      const messages = [
-        {
-          role: "system",
-          content:
-            systemBase +
-            (attempt > 0
-              ? "\n补充：图片数据已随本条消息一起发送，必须直接基于图片内容作答；禁止回答『看不到图片/无法读取图片』，不要复述任何能力限制。"
-              : ""),
-        },
-        // 第二次起图片放前面：有些网关只解析第一个 content part。
-        { role: "user", content: attempt > 0 ? [...imageParts, textPart] : [textPart, ...imageParts] },
-      ];
-
-      let data: any;
-      try {
-        data = await callChat(
-          messages,
-          false,
-          vision || undefined,
-          Math.min(32768, baseTokens + attempt * 4096)
-        );
-      } catch (err) {
-        lastReason = err instanceof Error ? err.message : String(err);
-        if (attempt < 2) {
-          await pause(600 * (attempt + 1));
-          continue;
-        }
-        throw new Error(`图片识别连续失败：${lastReason}`);
-      }
-
-      const text = String(data?.choices?.[0]?.message?.content ?? "").trim();
-      // 空正文说明推理耗尽：callChat 内部已经为此重试过 3 次，外层不再重复烧额度。
-      if (!text) {
-        throw new Error("视觉模型连续多次没有返回正文（推理耗尽）。把「最大输出 token」调到 16384，或换非推理型视觉模型再试。");
-      }
-      // 只有「整段都在拒绝」才算失败；局部出现「因无法直接读取包装背面…」是正常识别结果。
-      if (!isVisionRefusal(text)) return text;
-
-      lastReason = `这次没拿到图片内容：${text.slice(0, 100)}`;
-      if (attempt < 2) {
-        await pause(600 * (attempt + 1));
-        continue;
-      }
-    }
-
-    throw new Error(
-      `${lastReason}。Auto 连续 3 次路由到了不带视觉能力的型号；到「高级设置 → 视觉模型」单独指定一个视觉型号最稳，或直接点发送重发。`
-    );
-  };
-
-  // 发送消息（支持图片识别 + 工具循环：模型可多次调用工具直到达成目标）
-  const handleSendMessage = async () => {
-    const text = inputText.trim();
-    const images = pendingImages;
+  // 发送消息：图片先落盘，再交给模块级引擎生成。
+  // 生成流程不挂在页面上，切走页面 / 切到别的 App 都不会中断；回来靠 job 状态恢复 UI。
+  const startGeneration = useCallback(async (text: string, images: PendingImage[], targetId?: string) => {
     if (!text && images.length === 0) return;
     if (!state.aiConfig.isConfigured) {
       notify("提示", "请先配置 API Key");
@@ -789,174 +626,75 @@ export default function AIScreen() {
       return;
     }
 
-    // 先把用户消息落库再发请求：即使后续识别/回话失败，这条也不会消失。
-    // 只发图片时不往气泡里塞默认文字，界面上就只看到排列好的缩略图。
-    const userContent = text;
-    const userMsg = addAIMessage({
-      role: "user",
-      content: userContent,
-      ...(images.length
-        ? { images: images.map((img) => ({ name: img.name, mimeType: img.mimeType })) }
-        : {}),
-    });
-    if (images.length) imagePreviews.current[userMsg.id] = images.map((img) => img.uri);
-    messagesRef.current = [...messagesRef.current, userMsg];
+    let userMsg: AIMessage;
+    let removedIds: string[] = [];
+    if (!targetId) {
+      // 新消息：图片先落盘拿到 file:// uri，再落库（这样重进页面图片还在）。
+      const persisted = images.length
+        ? await persistChatImages(`pending_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, images)
+        : [];
+      userMsg = addAIMessage({
+        role: "user",
+        content: text,
+        ...(images.length ? { images: persisted } : {}),
+      });
+      if (images.length) imagePreviews.current[userMsg.id] = images.map((img) => img.uri);
+    } else {
+      // 重新生成：复用原消息，清掉它之后的旧回复与旧识别结果。
+      const existing = state.aiMessages.find((m) => m.id === targetId);
+      const idx = state.aiMessages.findIndex((m) => m.id === targetId);
+      removedIds = state.aiMessages
+        .slice(idx + 1)
+        .filter((m) => m.role === "assistant" && !m.archived)
+        .map((m) => m.id);
+      if (removedIds.length) {
+        const removeSet = new Set(removedIds);
+        setAIMessages((prev) => prev.filter((m) => !removeSet.has(m.id)));
+        removedIds.forEach((id) => deleteChatImages(id));
+      }
+      updateAIMessage(targetId, { imageAnalysis: undefined });
+      userMsg = {
+        ...(existing ?? { id: targetId, role: "user", timestamp: new Date().toISOString() }),
+        content: text,
+      };
+    }
 
     setInputText("");
     setPendingImages([]);
-    setIsLoading(true);
-    setToolActions([]);
+    clearJobResult();
 
-    const activeCustomPlan = state.userProfile.customNutritionPlan;
-    const systemPrompt =
-      generateSystemPrompt() +
-      "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加/删除动作、创建/查看/修改训练计划、开始/结束训练、增删改查饮食记录、添加食物、创建碳循环计划、保存自定义营养方案、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么。" +
-      "\n\n[饮食记录] 用户说一餐吃了多样食物时，必须调用 log_meal 把每样食物逐项放进 items，不要合并、不要只记第一样；每项都写全 name、quantity、unit、calories、carbs、protein、fats 和 mealType，数值不确定就按常见份量估算，不要省略字段。只记一样食物时用 log_nutrition，字段同样要全。记录后在回复里列出实际保存的食物与宏量供核对。" +
-      "\n\n[删除/修改饮食记录] 用户要删记录时调用 delete_nutrition（用「今日饮食明细」里的 id，或食物名 + 日期），要改克数/营养值时调用 update_nutrition（只改克数又想按比例联动就带 scaleMacros: true）。绝对不要通过再记一遍正确数据来覆盖旧记录——那会新增重复记录、原来的还在。删/改后回复里说明动的是哪几条。" +
-      "\n\n[查询饮食记录] 用户问「吃了什么/热量多少/某天的记录」时用 query_nutrition（可传 date 或 startDate+endDate，必要时加 name/mealType），返回里带每条记录的 id，可直接用于删改。要删改的记录不在今天时，先用它查到 id 再动手。" +
-      "\n\n[训练方案] 查看已有方案的具体内容（每天练什么、几组几次）用 query_workout_templates；用户要改已有方案时先查它拿到方案 ID 和各天/各动作的 index，再调 update_workout_template（精确小改用 operations，整体重写用 days，下标都从 0 开始）。只有「新建一个计划」才用 create_workout_template，别用新建去覆盖已有计划。" +
-      "\n\n[营养方案] 当用户询问饮食/营养参数建议（每日热量、蛋白、碳水、脂肪），或你主动给出一套具体数值方案时，务必调用 save_custom_nutrition_plan 把四个数值保存到「饮食 → 营养建议 → 自定义」并设为当前每日目标，回复里说明已保存；用户要求取消时可调用 clear_custom_nutrition_plan。回复里请用列表把四个数字写清楚，方便用户核对。" +
-      (activeCustomPlan?.enabled
-        ? `\n\n[当前自定义营养目标] ${formatPlanSummary(activeCustomPlan)}（已生效，给饮食建议时以此为准）`
-        : "") +
-      (images.length
-        ? `\n\n[图片] 本轮消息里附了 ${images.length} 张图片的识别结果。把它当作事实上下文来回答；其中若有食物热量、体测数值或训练组次，请调用对应工具保存，并在回复里说明存了什么。`
-        : "");
+    // 自己拼上下文快照：dispatch 是异步的，此刻 state.aiMessages 还没含新消息/还没删旧回复。
+    const removeSet = new Set(removedIds);
+    const snapshot = state.aiMessages
+      .filter((m) => !m.archived && !removeSet.has(m.id) && m.id !== userMsg.id)
+      .map((m) => (m.id === targetId ? userMsg : m));
+    snapshot.push(userMsg);
 
-    let executedCount = 0;
-    try {
-      let contextText = userContent;
+    // 重新生成时图片是 file:// 路径，要先读回 data URI 才能发给视觉模型。
+    const recognitionUris = await Promise.all(
+      images.map((img) => toDataUriForRecognition(img.uri))
+    );
+    await runGeneration({
+      text,
+      imageUris: recognitionUris,
+      userMessageId: userMsg.id,
+      messagesSnapshot: snapshot,
+      app,
+    });
+  }, [state.aiConfig.isConfigured, state.aiMessages, addAIMessage, updateAIMessage, setAIMessages, app]);
 
-      if (images.length) {
-        let analysis: string;
-        try {
-          analysis = await recognizeImages(images.map((img) => img.uri), text);
-        } catch (err) {
-          const raw = err instanceof Error ? err.message : String(err);
-          const hint = /image|vision|multimodal|modal|content|不支持|模态|400|404|图片/i.test(raw)
-            ? `Auto 这次可能路由到了不带视觉能力的型号；文字和图片已放回输入框，直接点发送重发即可。若持续失败，到「高级设置 → 视觉模型」单独指定视觉型号。`
-            : await diagnoseNetworkError(raw, baseUrl);
-          notify("失败 · 图片识别未完成（可重发）", `${raw}\n${hint}`);
-          // 失败不再往聊天里堆长篇错误：撤掉刚落库的用户消息并恢复输入，
-          // 一次点击即可重发，避免「失败一次多两条记录、翻下来太多」。
-          deleteOneMessage(userMsg.id);
-          messagesRef.current = messagesRef.current.filter((m) => m.id !== userMsg.id);
-          setInputText(text);
-          setPendingImages(images);
-          return;
-        }
-        // 识别文字只作为模型上下文与本机数据记录，气泡里不再堆说明文字。
-        updateAIMessage(userMsg.id, { imageAnalysis: analysis });
-        messagesRef.current = messagesRef.current.map((m) =>
-          m.id === userMsg.id ? { ...m, imageAnalysis: analysis } : m
-        );
-        contextText = [
-          text || "请分析这些图片",
-          "",
-          "[图片识别结果]",
-          analysis,
-          "",
-          "请基于以上识别结果回答。若其中包含可记录的数据（食物热量、体测数值、训练组次等），请调用对应工具保存，并在回复里说明存了什么。",
-        ].join("\n");
-      }
-
-      const conversation: any[] = [
-        { role: "system", content: systemPrompt },
-        // 用最新消息镜像，避免闭包里的旧 state 丢掉刚发的消息
-        ...messagesRef.current
-          .slice(-12)
-          .filter((m) => m.id !== userMsg.id)
-          .map((m) => ({
-            role: m.role,
-            // 纯图片消息没有文字正文，用保存的识别结果接着当上下文，避免空串让模型困惑。
-            content: m.content || (m.imageAnalysis ? `[此前图片识别结果] ${m.imageAnalysis}` : ""),
-          })),
-        { role: "user", content: contextText },
-      ];
-
-      let finalText = "";
-      for (let turn = 0; turn < 6; turn++) {
-        let data: any;
-        try {
-          data = await callChat(conversation);
-        } catch (err) {
-          // 首轮若因「网关不支持 tools」失败，自动退化成纯对话再试一次。
-          // 推理耗尽 / 502 的重试已在 callChat 内部处理，这里不重复发请求。
-          const msg = err instanceof Error ? err.message : String(err);
-          if (turn === 0 && /tool|function|not support|unsupported|参数/i.test(msg)) {
-            const bigger = Math.max(Number(maxTokens) || DEFAULT_MAX_TOKENS, 8192);
-            data = await callChat(conversation, false, undefined, bigger);
-          } else {
-            throw err;
-          }
-        }
-        const msg = data?.choices?.[0]?.message;
-        if (!msg) break;
-
-        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
-          conversation.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
-          for (const tc of msg.tool_calls) {
-            let args: Record<string, any> = {};
-            try {
-              args = JSON.parse(tc.function.arguments || "{}");
-            } catch {
-              args = {};
-            }
-            const result = await executeToolCall(tc.function.name, args, app);
-            executedCount++;
-            setToolActions((prev) => [...prev, { name: tc.function.name, args, result }]);
-            conversation.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify(result),
-            });
-          }
-          continue; // 带着工具结果再问一次模型
-        }
-
-        finalText = String(msg.content ?? "").trim();
-        if (!finalText) {
-          // 有些推理模型只给 reasoning_content，content 为空；别再回一句莫名其妙的「无法回应」。
-          finalText =
-            "模型这次没返回正文（多半把输出预算全花在推理上）。到「高级设置 → 最大输出 token」调大到 8192，或换非推理型模型后重发。";
-        }
-        conversation.push({ role: "assistant", content: finalText });
-        break;
-      }
-
-      if (finalText) {
-        addAIMessage({ role: "assistant", content: finalText });
-      } else if (executedCount > 0) {
-        addAIMessage({ role: "assistant", content: "（已为你执行上述操作）" });
-      } else {
-        addAIMessage({
-          role: "assistant",
-          content: "连续几轮都没拿到模型正文。多半是输出预算太小或工具调用不被网关支持：到「高级设置」把最大输出调到 8192，必要时关掉工具调用再重发。",
-        });
-      }
-    } catch (error) {
-      const detail = await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", baseUrl);
-      // 详细错误只放结果条（可关、可滚），不再写进聊天记录刷屏；
-      // 同时恢复输入并撤掉这条用户消息，点一下发送就能重发。
-      if (executedCount > 0) {
-        // 本轮已经写过数据，自动重发会重复记录，交给用户自己判断。
-        notify("失败 · 部分操作已执行", `${detail}\n\n本轮 AI 已执行 ${executedCount} 次写操作，为避免重复记录，没有自动恢复输入框。`);
-      } else {
-        notify("失败 · 未收到回复（可重发）", detail);
-        deleteOneMessage(userMsg.id);
-        messagesRef.current = messagesRef.current.filter((m) => m.id !== userMsg.id);
-        setInputText(text);
-        if (images.length) setPendingImages(images);
-      }
-    } finally {
-      setIsLoading(false);
-    }
+  const handleSendMessage = () => {
+    startGeneration(inputText.trim(), pendingImages);
   };
+
+
 
   // 清除当前对话：只清主视图，归档箱里的内容不动（要删去归档箱）。
   const handleClearMessages = () => {
     const doClear = () => {
+      const ids = activeMessages.map((m) => m.id);
       setAIMessages((prev) => prev.filter((m) => m.archived));
+      ids.forEach((id) => deleteChatImages(id));
       notify("成功 · 已清除", `已清空当前 ${activeMessages.length} 条消息；归档箱里 ${archivedMessages.length} 条未动`);
     };
     if (Platform.OS === "web") {
@@ -985,6 +723,47 @@ export default function AIScreen() {
 
   const deleteOneMessage = (id: string) => {
     setAIMessages((prev) => prev.filter((m) => m.id !== id));
+    deleteChatImages(id);
+  };
+
+  // 编辑重发：把这条用户消息的文字和图片放回输入框，并移除它和它之后的回复。
+  const handleEditResend = (msg: AIMessage) => {
+    const idx = state.aiMessages.findIndex((m) => m.id === msg.id);
+    const removeIds = state.aiMessages.slice(idx).map((m) => m.id);
+    const removeSet = new Set(removeIds);
+    setAIMessages((prev) => prev.filter((m) => !removeSet.has(m.id)));
+    removeIds.forEach((id) => deleteChatImages(id));
+
+    setInputText(msg.content || "");
+    // 图片本体在 imagePreviews（本次会话）或消息 uri（重进页面后）里，取出来放回输入框。
+    const savedUris = imagePreviews.current[msg.id] ||
+      [...(msg.images ?? []), ...(msg.image ? [msg.image] : [])]
+        .map((img) => img.uri)
+        .filter((u): u is string => !!u);
+    if (savedUris.length) {
+      setPendingImages(
+        savedUris.slice(0, MAX_IMAGES).map((uri, i) => ({
+          uri,
+          mimeType: msg.images?.[i]?.mimeType || msg.image?.mimeType || "image/jpeg",
+          name: msg.images?.[i]?.name || msg.image?.name,
+        }))
+      );
+    }
+    flatListRef.current?.scrollToEnd({ animated: true });
+  };
+
+  // 重新生成：沿用这条用户消息的内容，删掉它之后的旧回复，交给引擎重新跑一轮。
+  const handleRegenerate = (msg: AIMessage) => {
+    const savedUris = imagePreviews.current[msg.id] ||
+      [...(msg.images ?? []), ...(msg.image ? [msg.image] : [])]
+        .map((img) => img.uri)
+        .filter((u): u is string => !!u);
+    const images: PendingImage[] = savedUris.slice(0, MAX_IMAGES).map((uri, i) => ({
+      uri,
+      mimeType: msg.images?.[i]?.mimeType || msg.image?.mimeType || "image/jpeg",
+      name: msg.images?.[i]?.name || msg.image?.name,
+    }));
+    startGeneration(msg.content || "", images, msg.id);
   };
 
   const restoreOneMessage = (id: string) => {
@@ -994,7 +773,9 @@ export default function AIScreen() {
 
   const clearArchive = () => {
     const doClear = () => {
+      const ids = archivedMessages.map((m) => m.id);
       setAIMessages((prev) => prev.filter((m) => !m.archived));
+      ids.forEach((id) => deleteChatImages(id));
       notify("成功 · 归档已清空", `永久删除了 ${archivedMessages.length} 条归档消息`);
     };
     if (Platform.OS === "web") {
@@ -1058,87 +839,148 @@ export default function AIScreen() {
   }), [colors]);
 
   const renderMessage = ({ item }: { item: AIMessage }) => {
-    const previewUris = imagePreviews.current[item.id] || [];
-    // 兼容旧的单图消息；新消息走 images 数组。
-    const imageCount = Math.max(
-      previewUris.length,
-      item.images?.length ?? 0,
-      item.image ? 1 : 0
-    );
+    // 图片 uri 优先取持久化消息里的 file:// 路径（重进页面 / 重启后仍在），
+    // 内存 ref 只作为刚发送那一瞬间的即时预览兜底。
+    const persistedUris = [...(item.images ?? []), ...(item.image ? [item.image] : [])]
+      .map((img) => img.uri)
+      .filter((u): u is string => !!u);
+    const previewUris = persistedUris.length ? persistedUris : imagePreviews.current[item.id] || [];
+    const imageCount = Math.max(previewUris.length, item.images?.length ?? 0, item.image ? 1 : 0);
     const isUser = item.role === "user";
+    const expanded = expandedActions === item.id;
+    const timeText = new Date(item.timestamp).toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
     return (
-      <View className={`mb-3 ${isUser ? "items-end" : "items-start"}`}>
-        <Pressable onLongPress={() => setSelectionTarget(item)} delayLongPress={400}>
+      <View className={`mb-4 flex-row items-end ${isUser ? "justify-end" : "justify-start"}`}>
+        {/* AI 头像 */}
+        {!isUser && (
           <View
-            style={WEB_SELECTABLE}
-            className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-              isUser ? "bg-primary" : "bg-surface border border-border"
-            }`}
+            className="w-8 h-8 rounded-full items-center justify-center mr-2 mb-1"
+            style={{ backgroundColor: colors.primary + "1F" }}
           >
-            {imageCount > 0 && (
-              <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: item.content ? 8 : 0 }}>
-                {Array.from({ length: imageCount }, (_, index) => {
-                  const uri = previewUris[index];
-                  return uri ? (
-                    <Image
-                      key={index}
-                      source={{ uri }}
-                      style={IMAGE_TILE_STYLE}
-                      resizeMode="cover"
-                    />
-                  ) : (
-                    <View key={index} style={[IMAGE_TILE_STYLE, IMAGE_PLACEHOLDER_STYLE]}>
-                      <IconSymbol name="photo" size={22} color={isUser ? colors.background : colors.muted} />
-                    </View>
-                  );
-                })}
-              </View>
-            )}
-            {item.content ? (
-              isUser ? (
-                <Text selectable style={WEB_SELECTABLE} className="text-background">
-                  {item.content}
-                </Text>
-              ) : (
-                <Markdown style={markdownStyles} rules={SELECTABLE_MARKDOWN_RULES}>
-                  {item.content}
-                </Markdown>
-              )
-            ) : null}
+            <IconSymbol name="brain" size={17} color={colors.primary} />
           </View>
-        </Pressable>
-        <View className="flex-row items-center mt-1 px-2">
-          <Text className="text-muted text-xs">
-            {new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}
-          </Text>
-          {item.content ? (
-            <>
-              <TouchableOpacity onPress={() => handleCopy(item.content)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
-                <IconSymbol name="square.on.square" size={13} color={colors.muted} />
-                <Text className="text-muted text-xs ml-1">复制</Text>
-              </TouchableOpacity>
-              <TouchableOpacity onPress={() => setSelectionTarget(item)} className="ml-3 flex-row items-center" activeOpacity={0.7}>
-                <Text className="text-muted text-xs">选择文字</Text>
-              </TouchableOpacity>
-            </>
-          ) : null}
-          {item.role === "assistant" && (
-            <TouchableOpacity
-              onPress={() => handleSaveNutritionFromText(item.content)}
-              className="ml-3 flex-row items-center"
-              activeOpacity={0.7}
+        )}
+
+        <View className={isUser ? "items-end" : "items-start"} style={{ maxWidth: "82%" }}>
+          <Pressable
+            onPress={() => setExpandedActions(expanded ? null : item.id)}
+            onLongPress={() => setSelectionTarget(item)}
+            delayLongPress={400}
+          >
+            <View
+              style={[
+                WEB_SELECTABLE,
+                {
+                  borderRadius: 18,
+                  borderBottomRightRadius: isUser ? 5 : 18,
+                  borderBottomLeftRadius: isUser ? 18 : 5,
+                  shadowColor: "#000",
+                  shadowOpacity: 0.04,
+                  shadowRadius: 6,
+                  shadowOffset: { width: 0, height: 2 },
+                  elevation: 2,
+                },
+              ]}
+              className={`px-4 py-3 ${isUser ? "bg-primary" : "bg-surface border border-border"}`}
             >
-              <IconSymbol name="pencil" size={13} color={colors.muted} />
-              <Text className="text-muted text-xs ml-1">存入自定义</Text>
-            </TouchableOpacity>
+              {imageCount > 0 && (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: item.content ? 8 : 0 }}>
+                  {Array.from({ length: imageCount }, (_, index) => {
+                    const uri = previewUris[index];
+                    return uri ? (
+                      <Image key={index} source={{ uri }} style={IMAGE_TILE_STYLE} resizeMode="cover" />
+                    ) : (
+                      <View key={index} style={[IMAGE_TILE_STYLE, IMAGE_PLACEHOLDER_STYLE]}>
+                        <IconSymbol name="photo" size={22} color={isUser ? colors.background : colors.muted} />
+                      </View>
+                    );
+                  })}
+                </View>
+              )}
+              {item.content ? (
+                isUser ? (
+                  <Text selectable style={WEB_SELECTABLE} className="text-background leading-6">
+                    {item.content}
+                  </Text>
+                ) : (
+                  <Markdown style={markdownStyles} rules={SELECTABLE_MARKDOWN_RULES}>
+                    {item.content}
+                  </Markdown>
+                )
+              ) : null}
+            </View>
+          </Pressable>
+
+          <View className="flex-row items-center mt-1.5 px-1">
+            <Text className="text-muted text-[11px]">{timeText}</Text>
+            {!expanded && (
+              <TouchableOpacity onPress={() => setExpandedActions(item.id)} className="ml-2" activeOpacity={0.6}>
+                <Text className="text-muted text-[11px]">···</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+
+          {expanded && (
+            <View
+              className="mt-2 flex-row flex-wrap items-center gap-x-4 gap-y-2 px-1 py-2 rounded-xl border border-border bg-surface"
+              style={{ paddingHorizontal: 10 }}
+            >
+              {item.content ? (
+                <>
+                  <TouchableOpacity onPress={() => handleCopy(item.content)} className="flex-row items-center" activeOpacity={0.7}>
+                    <IconSymbol name="square.on.square" size={13} color={colors.muted} />
+                    <Text className="text-muted text-xs ml-1">复制</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => setSelectionTarget(item)} activeOpacity={0.7}>
+                    <Text className="text-muted text-xs">选择文字</Text>
+                  </TouchableOpacity>
+                </>
+              ) : null}
+              {isUser && (
+                <>
+                  <TouchableOpacity onPress={() => handleEditResend(item)} className="flex-row items-center" activeOpacity={0.7}>
+                    <IconSymbol name="pencil" size={13} color={colors.primary} />
+                    <Text className="text-primary text-xs ml-1">编辑重发</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity onPress={() => handleRegenerate(item)} className="flex-row items-center" activeOpacity={0.7}>
+                    <IconSymbol name="arrow.counterclockwise" size={13} color={colors.primary} />
+                    <Text className="text-primary text-xs ml-1">重新生成</Text>
+                  </TouchableOpacity>
+                </>
+              )}
+              {item.role === "assistant" && (
+                <TouchableOpacity
+                  onPress={() => handleSaveNutritionFromText(item.content)}
+                  className="flex-row items-center"
+                  activeOpacity={0.7}
+                >
+                  <IconSymbol name="pencil" size={13} color={colors.muted} />
+                  <Text className="text-muted text-xs ml-1">存入自定义</Text>
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity onPress={() => archiveOneMessage(item.id)} activeOpacity={0.7}>
+                <Text className="text-muted text-xs">归档</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => deleteOneMessage(item.id)} activeOpacity={0.7}>
+                <Text className="text-error text-xs">删除</Text>
+              </TouchableOpacity>
+            </View>
           )}
-          <TouchableOpacity onPress={() => archiveOneMessage(item.id)} className="ml-3" activeOpacity={0.7}>
-            <Text className="text-muted text-xs">归档</Text>
-          </TouchableOpacity>
-          <TouchableOpacity onPress={() => deleteOneMessage(item.id)} className="ml-3" activeOpacity={0.7}>
-            <Text className="text-muted text-xs">删除</Text>
-          </TouchableOpacity>
         </View>
+
+        {/* 用户头像 */}
+        {isUser && (
+          <View
+            className="w-8 h-8 rounded-full items-center justify-center ml-2 mb-1"
+            style={{ backgroundColor: colors.primary }}
+          >
+            <Text className="text-background text-sm font-semibold">我</Text>
+          </View>
+        )}
       </View>
     );
   };
@@ -1158,18 +1000,40 @@ export default function AIScreen() {
         style={{ flexShrink: 0 }}
       >
       {/* 头部 */}
-      <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
-        <TouchableOpacity onPress={() => router.back()} className="p-1">
-          <IconSymbol name="chevron.left" size={24} color={colors.foreground} />
+      <View className="flex-row items-center justify-between px-4 py-3 border-b border-border bg-surface">
+        <TouchableOpacity
+          onPress={() => router.back()}
+          className="w-9 h-9 rounded-full items-center justify-center bg-background border border-border"
+          activeOpacity={0.7}
+        >
+          <IconSymbol name="chevron.left" size={20} color={colors.foreground} />
         </TouchableOpacity>
-        <Text className="text-xl font-bold text-foreground">AI 助手</Text>
+        <View className="items-center">
+          <View className="flex-row items-center gap-1.5">
+            <View className="w-6 h-6 rounded-full items-center justify-center" style={{ backgroundColor: colors.primary + "22" }}>
+              <IconSymbol name="brain" size={14} color={colors.primary} />
+            </View>
+            <Text className="text-lg font-bold text-foreground">AI 助手</Text>
+          </View>
+          <Text className="text-[11px] text-muted mt-0.5">记录 · 分析 · 建议</Text>
+        </View>
         <View className="flex-row gap-2">
-          <TouchableOpacity onPress={() => setShowConfig(!showConfig)} className="p-1">
-            <IconSymbol name="gearshape.fill" size={22} color={showConfig ? colors.primary : colors.muted} />
+          <TouchableOpacity
+            onPress={() => setShowConfig(!showConfig)}
+            className={`w-9 h-9 rounded-full items-center justify-center border ${
+              showConfig ? "bg-primary border-primary" : "bg-background border-border"
+            }`}
+            activeOpacity={0.7}
+          >
+            <IconSymbol name="gearshape.fill" size={18} color={showConfig ? colors.background : colors.muted} />
           </TouchableOpacity>
           {activeMessages.length > 0 && (
-            <TouchableOpacity onPress={handleClearMessages} className="p-1">
-              <IconSymbol name="trash" size={22} color={colors.muted} />
+            <TouchableOpacity
+              onPress={handleClearMessages}
+              className="w-9 h-9 rounded-full items-center justify-center bg-background border border-border"
+              activeOpacity={0.7}
+            >
+              <IconSymbol name="trash" size={18} color={colors.muted} />
             </TouchableOpacity>
           )}
         </View>
@@ -1566,12 +1430,34 @@ export default function AIScreen() {
           </TouchableOpacity>
         )}
 
-        {/* 加载指示器 */}
+        {/* 生成中提示：状态来自模块级引擎，切走页面仍在生成，回来就能看到 */}
         {isLoading && (
           <View className="px-5 pb-2">
-            <View className="bg-surface rounded-2xl px-4 py-3 self-start border border-border">
+            <View className="bg-surface rounded-2xl px-4 py-3 self-start border border-border flex-row items-center gap-2">
               <ActivityIndicator size="small" color={colors.primary} />
+              <Text className="text-muted text-xs">
+                {job.turn > 0 ? `正在生成（第 ${job.turn} 轮）· 可以离开页面，完成后会通知你` : "正在理解你的问题…可以离开页面"}
+              </Text>
             </View>
+          </View>
+        )}
+
+        {/* 上一轮生成结果摘要（含后台完成 / 失败的反馈） */}
+        {!isLoading && job.lastResult && (
+          <View className="px-5 pb-2">
+            <TouchableOpacity
+              onPress={clearJobResult}
+              className={`rounded-xl px-4 py-2 self-start border ${
+                job.lastResult.ok ? "bg-success/10 border-success/30" : "bg-error/10 border-error/30"
+              }`}
+              activeOpacity={0.7}
+            >
+              <Text className={`text-xs ${job.lastResult.ok ? "text-success" : "text-error"}`}>
+                {job.lastResult.ok ? "✓ " : "✕ "}
+                {job.lastResult.text}
+                {" · 点此关闭"}
+              </Text>
+            </TouchableOpacity>
           </View>
         )}
 
