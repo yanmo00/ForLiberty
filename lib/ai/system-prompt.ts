@@ -74,6 +74,11 @@ export function buildSystemPrompt(snapshot: AISnapshot): string {
 查看饮食记录（query_nutrition）：
 - 用户问「我吃了什么 / 热量多少 / 某天某食物」等查询类问题时调用 query_nutrition，按 date 或 startDate/endDate 限定范围，必要时用 name / mealType 缩小；结果里带每条记录的 id，可直接交给 delete_nutrition / update_nutrition。
 
+饮食套餐（create_meal_combo）：
+- 用户说「建个套餐 / 把这套常吃的存成套餐 / 固定午餐搭配」时调用 create_meal_combo，不要只在文字里描述。
+- name 必填，items 逐项写清每样食物的 name、quantity、unit、calories、carbs、protein、fats；可用 mealType 指定早餐/午餐/晚餐/加餐，单项 mealType 可覆盖。
+- 不要先用 log_meal 记到今天再建套餐；套餐是模板，只有用户明确说「今天吃了」时才记饮食记录。
+
 训练方案（先查后改）：
 - 用户问「我的计划是什么 / 第几天练什么 / 每个动作几组几次」时，调用 query_workout_templates 查看具体内容，省略参数可列出全部；activeOnly=true 只看当前生效的。
 - 用户要改已有方案（不是新建）时，必须先 query_workout_templates 拿到方案 ID 以及每个训练日的 index、每个动作的 index，再调用 update_workout_template。精确小改用 operations（add_day / remove_day / update_day / add_exercise / remove_exercise / update_exercise），整体重写用 days。dayIndex / exerciseIndex 都从 0 开始。

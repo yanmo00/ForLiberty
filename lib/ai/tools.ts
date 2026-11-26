@@ -691,6 +691,51 @@ export const AI_TOOLS: Record<string, unknown>[] = [
       parameters: { type: "object", properties: {} },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "create_meal_combo",
+      description:
+        "新建一个饮食套餐（把一套固定吃的食物存成模板，之后用户可在饮食页一键记录）。用户说「帮我建个套餐/常吃搭配/固定午餐」时调用。每项都要写清食物名、份量、单位、热量和三大宏量；营养不确定的按常见食物估算。mealType 可指定套餐默认餐次（早餐/午餐/晚餐/加餐）。",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "套餐名称，如「早餐固定搭配」" },
+          mealType: {
+            type: "string",
+            enum: ["breakfast", "lunch", "dinner", "snack"],
+            description: "套餐默认餐次，省略则按添加时的时间推断",
+          },
+          items: {
+            type: "array",
+            description: "套餐里的所有食物，逐项列出",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                quantity: { type: "number", description: "份量数值" },
+                unit: { type: "string", enum: ["g", "ml", "serving"] },
+                calories: { type: "number" },
+                carbs: { type: "number" },
+                protein: { type: "number" },
+                fats: { type: "number" },
+                foodId: { type: "string", description: "食物库 ID，省略时按名称自动匹配" },
+                source: { type: "string", enum: ["database", "custom", "quick"] },
+                mealType: {
+                  type: "string",
+                  enum: ["breakfast", "lunch", "dinner", "snack"],
+                  description: "单项餐次，省略则跟随套餐默认餐次",
+                },
+                notes: { type: "string" },
+              },
+              required: ["name", "quantity", "calories", "carbs", "protein", "fats"],
+            },
+          },
+        },
+        required: ["name", "items"],
+      },
+    },
+  },
 ];
 
 // ── 动作分发 ──────────────────────────────────────────────────────────
@@ -1349,6 +1394,37 @@ export async function executeToolCall(
           fatsPer100g: args.fatsPer100g ?? 0,
         });
         return { ok: true, summary: `已添加食物：${f.name}` };
+      }
+
+      case "create_meal_combo": {
+        const name = String(args.name ?? "").trim();
+        const rawItems = Array.isArray(args.items) ? args.items : [];
+        const validItems = rawItems.filter((i: any) => String(i?.name ?? "").trim());
+        if (!name) return { ok: false, summary: "套餐名称不能为空" };
+        if (!validItems.length) return { ok: false, summary: "套餐里至少要有一样食物" };
+        const mealType = NUTRITION_MEAL_TYPES.includes(args.mealType) ? args.mealType : undefined;
+        const combo = await app.addMealCombo({
+          name,
+          mealType,
+          items: validItems.map((i: any) => ({
+            name: String(i.name).trim(),
+            quantity: Number(i.quantity) || 0,
+            unit: ["g", "ml", "serving"].includes(i.unit) ? i.unit : "g",
+            calories: Number(i.calories) || 0,
+            carbs: Number(i.carbs) || 0,
+            protein: Number(i.protein) || 0,
+            fats: Number(i.fats) || 0,
+            foodId: i.foodId,
+            source: ["database", "custom", "quick"].includes(i.source) ? i.source : "quick",
+            mealType: NUTRITION_MEAL_TYPES.includes(i.mealType) ? i.mealType : mealType,
+            notes: i.notes,
+          })),
+        });
+        const kcal = combo.items.reduce((sum, i) => sum + (Number(i.calories) || 0), 0);
+        return {
+          ok: true,
+          summary: `已创建饮食套餐「${combo.name}」${mealType ? `（${MEAL_TYPE_NAMES[mealType as keyof typeof MEAL_TYPE_NAMES]}）` : ""}：${combo.items.length} 项，共 ${Math.round(kcal)} kcal。用户可在「饮食 → 饮食套餐」点套餐名一键记录，长按可编辑。`,
+        };
       }
 
       case "create_carb_cycle_plan": {

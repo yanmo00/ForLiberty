@@ -61,9 +61,20 @@ export default function NutritionScreen() {
   const [comboName, setComboName] = useState("");
   const [comboItems, setComboItems] = useState<MealComboItem[]>([]);
   const [editingCombo, setEditingCombo] = useState<MealCombo | null>(null);
+  // 套餐整体默认餐次；单项可以再单独覆盖。
+  const [comboMealType, setComboMealType] = useState<MealType | undefined>(undefined);
   const [comboSearch, setComboSearch] = useState("");
   const [comboDraftFood, setComboDraftFood] = useState<(FoodLibraryItem & { source: "database" | "custom" }) | null>(null);
   const [comboDraftQty, setComboDraftQty] = useState("100");
+  // 逐项编辑套餐内容：名称 / 份量 / 热量 / 宏量 / 餐次。
+  const [editingComboItemIndex, setEditingComboItemIndex] = useState<number | null>(null);
+  const [itemDraft, setItemDraft] = useState<MealComboItem | null>(null);
+  // 输入框用字符串保存，避免输入 "1." 时被 Number() 立刻改回 "1"。
+  const [itemQtyText, setItemQtyText] = useState("");
+  const [itemCaloriesText, setItemCaloriesText] = useState("");
+  const [itemProteinText, setItemProteinText] = useState("");
+  const [itemCarbsText, setItemCarbsText] = useState("");
+  const [itemFatsText, setItemFatsText] = useState("");
 
   const [showCustomFoodModal, setShowCustomFoodModal] = useState(false);
   const [customFoodName, setCustomFoodName] = useState("");
@@ -346,6 +357,18 @@ export default function NutritionScreen() {
     await updateUserProfile({ favoriteFoodIds: next });
   };
 
+  // 自定义食物编辑器：新增与修改共用同一套表单，列表里点「编辑」直接带出原值。
+  const openCustomFoodEditor = (food?: FoodLibraryItem) => {
+    setEditingFood(food ?? null);
+    setCustomFoodName(food?.name ?? "");
+    setCustomCategory(food?.category ?? "protein");
+    setCustomCalories(food ? String(food.caloriesPer100g) : "");
+    setCustomProtein(food ? String(food.proteinPer100g) : "");
+    setCustomCarbs(food ? String(food.carbsPer100g) : "");
+    setCustomFats(food ? String(food.fatsPer100g) : "");
+    setShowCustomFoodModal(true);
+  };
+
   // 改克数时按「原记录克数 → 新克数」的比例同步营养数据。
   // 只在编辑已有记录时生效（新增时由食物库每 100g 数据负责折算）。
   const handleQuantityChange = (value: string, forceScale = false) => {
@@ -367,9 +390,12 @@ export default function NutritionScreen() {
     setComboName("");
     setComboItems([]);
     setEditingCombo(null);
+    setComboMealType(undefined);
     setComboSearch("");
     setComboDraftFood(null);
     setComboDraftQty("100");
+    setEditingComboItemIndex(null);
+    setItemDraft(null);
   };
 
   const handleOpenComboEditor = (combo?: MealCombo) => {
@@ -377,13 +403,59 @@ export default function NutritionScreen() {
       setEditingCombo(combo);
       setComboName(combo.name);
       setComboItems(combo.items.map((item) => ({ ...item })));
+      setComboMealType(combo.mealType);
     } else {
       resetComboEditor();
     }
     setComboSearch("");
     setComboDraftFood(null);
     setComboDraftQty("100");
+    setEditingComboItemIndex(null);
+    setItemDraft(null);
     setShowComboModal(true);
+  };
+
+  // 改套餐默认餐次：同步写到每一项，之后仍可逐项覆盖。
+  const handleComboMealTypeChange = (type?: MealType) => {
+    setComboMealType(type);
+    setComboItems((prev) => prev.map((item) => ({ ...item, mealType: type })));
+  };
+
+  const openComboItemEditor = (index: number) => {
+    const item = comboItems[index];
+    setEditingComboItemIndex(index);
+    setItemDraft({ ...item });
+    setItemQtyText(String(item.quantity));
+    setItemCaloriesText(String(item.calories));
+    setItemProteinText(String(item.protein));
+    setItemCarbsText(String(item.carbs));
+    setItemFatsText(String(item.fats));
+  };
+
+  const saveComboItemDraft = () => {
+    if (!itemDraft || editingComboItemIndex === null) return;
+    if (!itemDraft.name.trim()) {
+      Alert.alert("提示", "请输入食物名称");
+      return;
+    }
+    setComboItems((prev) =>
+      prev.map((item, i) =>
+        i === editingComboItemIndex
+          ? {
+              ...item,
+              ...itemDraft,
+              name: itemDraft.name.trim(),
+              quantity: Number(itemQtyText) || 0,
+              calories: Number(itemCaloriesText) || 0,
+              protein: Number(itemProteinText) || 0,
+              carbs: Number(itemCarbsText) || 0,
+              fats: Number(itemFatsText) || 0,
+            }
+          : item
+      )
+    );
+    setEditingComboItemIndex(null);
+    setItemDraft(null);
   };
 
   // 最省事的建套餐方式：今天已经记过的那几样，一键变成套餐。
@@ -453,9 +525,15 @@ export default function NutritionScreen() {
     }
     try {
       if (editingCombo) {
-        await updateMealCombo({ ...editingCombo, name, items: comboItems, updatedAt: new Date().toISOString() });
+        await updateMealCombo({
+          ...editingCombo,
+          name,
+          items: comboItems,
+          mealType: comboMealType,
+          updatedAt: new Date().toISOString(),
+        });
       } else {
-        await addMealCombo({ name, items: comboItems });
+        await addMealCombo({ name, items: comboItems, mealType: comboMealType });
       }
       setShowComboModal(false);
       resetComboEditor();
@@ -503,7 +581,7 @@ export default function NutritionScreen() {
                 protein: item.protein,
                 fats: item.fats,
                 source: item.source ?? "quick",
-                mealType: item.mealType ?? inferMealType(),
+                mealType: item.mealType ?? combo.mealType ?? inferMealType(),
                 notes: item.notes,
               });
             }
@@ -757,6 +835,7 @@ export default function NutritionScreen() {
                     >
                       <Text className="text-foreground text-sm font-medium">{combo.name}</Text>
                       <Text className="text-muted text-xs mt-0.5">
+                        {combo.mealType ? `${MEAL_TYPE_NAMES[combo.mealType]} · ` : ""}
                         {combo.items.length} 项 · {comboCalories} kcal
                       </Text>
                     </TouchableOpacity>
@@ -767,6 +846,36 @@ export default function NutritionScreen() {
               <Text className="text-muted text-xs">
                 把常吃的一套食物存成套餐，点一下就能整套餐记到当天（长按套餐可编辑）。
               </Text>
+            )}
+          </View>
+
+          {/* 自定义食物：显式列出并可修改，不用再靠长按隐藏入口 */}
+          <View className="px-5 py-2">
+            <View className="flex-row items-center justify-between mb-2">
+              <Text className="text-foreground font-semibold">自定义食物</Text>
+              <TouchableOpacity onPress={() => openCustomFoodEditor()} activeOpacity={0.7}>
+                <Text className="text-primary text-xs">＋ 新增</Text>
+              </TouchableOpacity>
+            </View>
+            {state.customFoods.length > 0 ? (
+              state.customFoods.map((food) => (
+                <TouchableOpacity
+                  key={food.id}
+                  onPress={() => openCustomFoodEditor(food)}
+                  className="flex-row items-center justify-between bg-surface rounded-xl px-3 py-2.5 mb-2 border border-border"
+                  activeOpacity={0.7}
+                >
+                  <View className="flex-1">
+                    <Text className="text-foreground text-sm">{food.name}</Text>
+                    <Text className="text-muted text-xs mt-0.5">
+                      {food.caloriesPer100g} kcal/100g · 蛋白 {food.proteinPer100g}g · 碳水 {food.carbsPer100g}g · 脂肪 {food.fatsPer100g}g
+                    </Text>
+                  </View>
+                  <Text className="text-primary text-xs ml-2">编辑</Text>
+                </TouchableOpacity>
+              ))
+            ) : (
+              <Text className="text-muted text-xs">还没有自定义食物。新增后可在这里随时修改内容。</Text>
             )}
           </View>
 
@@ -835,16 +944,7 @@ export default function NutritionScreen() {
                         <TouchableOpacity
                           onPress={() => handleSelectFood(item)}
                           onLongPress={() => {
-                            if (item.source === "custom") {
-                              setEditingFood(item);
-                              setCustomFoodName(item.name);
-                              setCustomCategory(item.category);
-                              setCustomCalories(String(item.caloriesPer100g));
-                              setCustomProtein(String(item.proteinPer100g));
-                              setCustomCarbs(String(item.carbsPer100g));
-                              setCustomFats(String(item.fatsPer100g));
-                              setShowCustomFoodModal(true);
-                            }
+                            if (item.source === "custom") openCustomFoodEditor(item);
                           }}
                           className="py-2 border-b border-border"
                         >
@@ -977,15 +1077,7 @@ export default function NutritionScreen() {
                   className="flex-1 bg-background rounded-lg px-3 py-2 text-foreground border border-border"
                 />
                 <TouchableOpacity
-                  onPress={() => {
-                    setShowCustomFoodModal(true);
-                    setEditingFood(null);
-                    setCustomFoodName("");
-                    setCustomCalories("");
-                    setCustomProtein("");
-                    setCustomCarbs("");
-                    setCustomFats("");
-                  }}
+                  onPress={() => openCustomFoodEditor()}
                   className="flex-1 bg-muted/20 rounded-lg items-center justify-center"
                 >
                   <Text className="text-foreground">添加自定义食物</Text>
@@ -1440,6 +1532,33 @@ export default function NutritionScreen() {
               placeholderTextColor={colors.muted}
               className="bg-surface rounded-lg px-4 py-3 text-foreground border border-border mb-3"
             />
+            <Text className="text-muted text-xs mb-2">套餐餐次（可留空，按添加时的时间推断）</Text>
+            <View className="flex-row flex-wrap gap-2 mb-4">
+              {([
+                { value: undefined, label: "不限" },
+                ...(["breakfast", "lunch", "dinner", "snack"] as MealType[]).map((m) => ({
+                  value: m,
+                  label: MEAL_TYPE_NAMES[m],
+                })),
+              ]).map((option) => {
+                const selected = comboMealType === option.value;
+                return (
+                  <TouchableOpacity
+                    key={option.label}
+                    onPress={() => handleComboMealTypeChange(option.value)}
+                    className={`px-3 py-2 rounded-lg ${
+                      selected ? "bg-primary" : "bg-surface border border-border"
+                    }`}
+                    activeOpacity={0.7}
+                  >
+                    <Text className={selected ? "text-background text-xs" : "text-foreground text-xs"}>
+                      {option.label}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
             <TouchableOpacity
               onPress={handleImportTodayAsCombo}
               className="bg-primary/10 rounded-lg py-3 items-center mb-5 border border-border"
@@ -1452,19 +1571,28 @@ export default function NutritionScreen() {
             {comboItems.length > 0 ? (
               <View className="mb-5">
                 {comboItems.map((item, index) => (
-                  <View key={`${item.name}-${index}`} className="flex-row items-center bg-surface rounded-lg px-3 py-2 mb-2 border border-border">
-                    <View className="flex-1">
-                      <Text className="text-foreground">{item.name}</Text>
-                      <Text className="text-muted text-xs mt-0.5">
-                        {item.quantity}{item.unit === "serving" ? "份" : item.unit} · {item.calories} kcal · 蛋白 {item.protein}g / 碳水 {item.carbs}g / 脂肪 {item.fats}g
-                      </Text>
+                  <View key={`${item.name}-${index}`} className="bg-surface rounded-lg px-3 py-2 mb-2 border border-border">
+                    <View className="flex-row items-center">
+                      <View className="flex-1">
+                        <Text className="text-foreground">{item.name}</Text>
+                        <Text className="text-muted text-xs mt-0.5">
+                          {item.quantity}{item.unit === "serving" ? "份" : item.unit} · {item.calories} kcal · 蛋白 {item.protein}g / 碳水 {item.carbs}g / 脂肪 {item.fats}g
+                          {item.mealType ? ` · ${MEAL_TYPE_NAMES[item.mealType]}` : ""}
+                        </Text>
+                      </View>
+                      <TouchableOpacity
+                        onPress={() => openComboItemEditor(index)}
+                        className="ml-2 px-2 py-1"
+                      >
+                        <Text className="text-primary">修改</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        onPress={() => setComboItems((prev) => prev.filter((_, i) => i !== index))}
+                        className="ml-1 px-2 py-1"
+                      >
+                        <Text className="text-error">移除</Text>
+                      </TouchableOpacity>
                     </View>
-                    <TouchableOpacity
-                      onPress={() => setComboItems((prev) => prev.filter((_, i) => i !== index))}
-                      className="ml-2 px-2 py-1"
-                    >
-                      <Text className="text-error">移除</Text>
-                    </TouchableOpacity>
                   </View>
                 ))}
               </View>
@@ -1528,6 +1656,119 @@ export default function NutritionScreen() {
               </TouchableOpacity>
             )}
           </ScrollView>
+        </ScreenContainer>
+      </Modal>
+
+      {/* 套餐单项编辑：食物名 / 份量 / 营养参数 / 餐次 */}
+      <Modal
+        visible={editingComboItemIndex !== null && !!itemDraft}
+        animationType="slide"
+        presentationStyle="pageSheet"
+      >
+        <ScreenContainer className="flex-1">
+          <View className="flex-row items-center justify-between px-5 py-4 border-b border-border">
+            <TouchableOpacity onPress={() => { setEditingComboItemIndex(null); setItemDraft(null); }}>
+              <Text className="text-primary">取消</Text>
+            </TouchableOpacity>
+            <Text className="text-lg font-semibold text-foreground">修改套餐食物</Text>
+            <TouchableOpacity onPress={saveComboItemDraft}>
+              <Text className="text-primary font-semibold">保存</Text>
+            </TouchableOpacity>
+          </View>
+          {itemDraft && (
+            <ScrollView className="flex-1" contentContainerStyle={{ padding: 20 }}>
+              <TextInput
+                value={itemDraft.name}
+                onChangeText={(text) => setItemDraft({ ...itemDraft, name: text })}
+                placeholder="食物名称"
+                placeholderTextColor={colors.muted}
+                className="bg-surface rounded-lg px-4 py-3 text-foreground border border-border mb-3"
+              />
+              <View className="flex-row items-center gap-2 mb-3 flex-wrap">
+                <Text className="text-muted text-sm">单位</Text>
+                {(["g", "ml", "serving"] as const).map((u) => (
+                  <TouchableOpacity
+                    key={u}
+                    onPress={() => setItemDraft({ ...itemDraft, unit: u })}
+                    className={`px-3 py-1.5 rounded-lg ${itemDraft.unit === u ? "bg-primary" : "bg-surface border border-border"}`}
+                    activeOpacity={0.7}
+                  >
+                    <Text className={itemDraft.unit === u ? "text-background text-xs" : "text-foreground text-xs"}>
+                      {u === "g" ? "克(g)" : u === "ml" ? "毫升(ml)" : "份"}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              <View className="flex-row gap-2 mb-3">
+                <TextInput
+                  value={itemQtyText}
+                  onChangeText={setItemQtyText}
+                  placeholder="份量"
+                  keyboardType="decimal-pad"
+                  placeholderTextColor={colors.muted}
+                  className="flex-1 bg-surface rounded-lg px-4 py-3 text-foreground border border-border"
+                />
+                <TextInput
+                  value={itemCaloriesText}
+                  onChangeText={setItemCaloriesText}
+                  placeholder="热量 kcal"
+                  keyboardType="decimal-pad"
+                  placeholderTextColor={colors.muted}
+                  className="flex-1 bg-surface rounded-lg px-4 py-3 text-foreground border border-border"
+                />
+              </View>
+              <View className="flex-row gap-2 mb-3">
+                <TextInput
+                  value={itemProteinText}
+                  onChangeText={setItemProteinText}
+                  placeholder="蛋白 g"
+                  keyboardType="decimal-pad"
+                  placeholderTextColor={colors.muted}
+                  className="flex-1 bg-surface rounded-lg px-4 py-3 text-foreground border border-border"
+                />
+                <TextInput
+                  value={itemCarbsText}
+                  onChangeText={setItemCarbsText}
+                  placeholder="碳水 g"
+                  keyboardType="decimal-pad"
+                  placeholderTextColor={colors.muted}
+                  className="flex-1 bg-surface rounded-lg px-4 py-3 text-foreground border border-border"
+                />
+              </View>
+              <TextInput
+                value={itemFatsText}
+                onChangeText={setItemFatsText}
+                placeholder="脂肪 g"
+                keyboardType="decimal-pad"
+                placeholderTextColor={colors.muted}
+                className="bg-surface rounded-lg px-4 py-3 text-foreground border border-border mb-4"
+              />
+              <Text className="text-muted text-xs mb-2">这一项的餐次（优先于套餐默认餐次）</Text>
+              <View className="flex-row flex-wrap gap-2">
+                {([
+                  { value: undefined, label: "跟随套餐" },
+                  ...(["breakfast", "lunch", "dinner", "snack"] as MealType[]).map((m) => ({
+                    value: m,
+                    label: MEAL_TYPE_NAMES[m],
+                  })),
+                ]).map((option) => {
+                  const selected = itemDraft.mealType === option.value;
+                  return (
+                    <TouchableOpacity
+                      key={option.label}
+                      onPress={() => setItemDraft({ ...itemDraft, mealType: option.value })}
+                      className={`px-3 py-2 rounded-lg ${selected ? "bg-primary" : "bg-surface border border-border"}`}
+                      activeOpacity={0.7}
+                    >
+                      <Text className={selected ? "text-background text-xs" : "text-foreground text-xs"}>
+                        {option.label}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </ScrollView>
+          )}
         </ScreenContainer>
       </Modal>
 

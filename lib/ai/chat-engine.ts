@@ -58,6 +58,11 @@ const EMPTY_JOB: GenerationJob = {
 
 let job: GenerationJob = { ...EMPTY_JOB };
 const listeners = new Set<() => void>();
+// 当前生成请求：取消时中止正在进行的网络请求，并在工具循环里检查标志。
+let activeAbortController: AbortController | null = null;
+let cancelRequested = false;
+// 每次生成分配 token，避免「取消后立刻重发」时旧请求回来覆盖新任务状态。
+let generationToken = 0;
 
 function emit() {
   listeners.forEach((l) => l());
@@ -79,6 +84,26 @@ export function getJobSnapshot(): GenerationJob {
 
 export function clearJobResult() {
   if (!job.running) updateJob({ lastResult: null });
+}
+
+/** 取消本轮生成：中止网络请求，并立即把 UI 状态恢复为可再次输入。 */
+export function cancelGeneration() {
+  if (!job.running) return;
+  cancelRequested = true;
+  generationToken++; // 让仍在跑的旧任务失效，避免它结束时覆盖「已取消」状态
+  activeAbortController?.abort();
+  updateJob({
+    running: false,
+    lastResult: {
+      ok: false,
+      text: "已取消本次生成（已执行的工具操作不会撤销）",
+      at: new Date().toISOString(),
+    },
+  });
+}
+
+function assertNotCancelled() {
+  if (cancelRequested) throw new Error("GENERATION_CANCELLED");
 }
 
 const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -114,6 +139,7 @@ function buildPrompt(app: AppContextType, hasImages: boolean): string {
     base +
     "\n\n[工具] 你可以直接调用工具来操作用户的 App（记录体测、添加/删除动作、创建/查看/修改训练计划、开始/结束训练、增删改查饮食记录、添加食物、创建碳循环计划、保存自定义营养方案、更新个人资料、设置当前计划、删除数据）。动手前先用一句中文说明要做什么。" +
     "\n\n[饮食记录] 用户说一餐吃了多样食物时，必须调用 log_meal 把每样食物逐项放进 items，不要合并、不要只记第一样；每项都写全 name、quantity、unit、calories、carbs、protein、fats 和 mealType。只记一样食物时用 log_nutrition。" +
+    "\n\n[饮食套餐] 用户说「建个套餐/固定午餐搭配/把这套存成套餐」时调用 create_meal_combo（name + items，每项写全份量与宏量，可用 mealType 指定早中晚餐）；套餐是模板，不要先记到今天。" +
     "\n\n[删除/修改饮食记录] 用户要删记录时调用 delete_nutrition，要改克数/营养值时调用 update_nutrition（只改克数又想按比例联动就带 scaleMacros: true）。绝对不要通过再记一遍正确数据来覆盖旧记录。" +
     "\n\n[查询饮食记录] 用户问「吃了什么/某天的记录」时用 query_nutrition；要删改的记录不在今天时，先用它查到 id 再动手。" +
     "\n\n[训练方案] 查看已有方案用 query_workout_templates；改已有方案先查它拿到 ID 和下标，再调 update_workout_template。只有「新建」才用 create_workout_template。" +
@@ -160,6 +186,7 @@ async function callChat(
       target,
       withProxyHeadersFor(cfg.baseUrl, {
         method: "POST",
+        signal: activeAbortController?.signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${cfg.apiKey}`,
@@ -241,6 +268,7 @@ async function recognizeImages(
       target,
       withProxyHeadersFor(cfg.baseUrl, {
         method: "POST",
+        signal: activeAbortController?.signal,
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${cfg.apiKey}`,
@@ -292,6 +320,9 @@ export async function runGeneration(params: GenerateParams): Promise<void> {
   // 页面卸载后 liveApp 仍由 AppProvider 维护，所以后台生成也能写到最新数据。
   const live = () => getLiveApp() ?? params.app;
   const cfg = effectiveConfig(live());
+  const token = ++generationToken;
+  cancelRequested = false;
+  activeAbortController = new AbortController();
 
   updateJob({
     running: true,
@@ -310,6 +341,7 @@ export async function runGeneration(params: GenerateParams): Promise<void> {
       try {
         analysis = await recognizeImages(cfg, imageUris, text);
       } catch (err) {
+        if (cancelRequested || token !== generationToken) return;
         const raw = err instanceof Error ? err.message : String(err);
         const detail = await diagnoseNetworkError(raw, cfg.baseUrl);
         finish(false, `图片识别未完成：${detail}`);
@@ -340,6 +372,7 @@ export async function runGeneration(params: GenerateParams): Promise<void> {
 
     let finalText = "";
     for (let turn = 0; turn < 6; turn++) {
+      assertNotCancelled();
       updateJob({ turn: turn + 1 });
       let data: any;
       try {
@@ -358,6 +391,7 @@ export async function runGeneration(params: GenerateParams): Promise<void> {
       if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
         conversation.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
         for (const tc of msg.tool_calls) {
+          assertNotCancelled();
           let args: Record<string, any> = {};
           try {
             args = JSON.parse(tc.function.arguments || "{}");
@@ -394,6 +428,8 @@ export async function runGeneration(params: GenerateParams): Promise<void> {
     live().addAIMessage({ role: "assistant", content: reply });
     finish(true, reply.slice(0, 120));
   } catch (error) {
+    // 用户点「取消生成」后：用户消息保留，但不写一条误导性的失败回复。
+    if (cancelRequested || token !== generationToken) return;
     const detail = await diagnoseNetworkError(error instanceof Error ? error.message : "未知错误", cfg.baseUrl);
     // 关键：失败不再删除用户消息。消息保留，回复里说明失败原因，用户可直接「重新生成」。
     const failText = executedCount > 0
@@ -404,6 +440,8 @@ export async function runGeneration(params: GenerateParams): Promise<void> {
   }
 
   function finish(ok: boolean, text: string) {
+    if (token !== generationToken) return;
+    activeAbortController = null;
     updateJob({ running: false, lastResult: { ok, text, at: new Date().toISOString() } });
     notifyIfBackground(ok ? "AI 回复已完成" : "AI 回复失败", text);
   }

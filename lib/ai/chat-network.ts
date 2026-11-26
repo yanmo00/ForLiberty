@@ -91,10 +91,13 @@ export async function fetchWithRetry(
 ): Promise<Response> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (init.signal?.aborted) throw lastError ?? new Error("请求已取消");
     try {
       return await fetch(url, init);
     } catch (error) {
       lastError = error;
+      // 用户主动取消时不要重试，否则界面已恢复、请求还在后台跑。
+      if (init.signal?.aborted) throw error;
       if (attempt < retries) await new Promise((r) => setTimeout(r, 800));
     }
   }

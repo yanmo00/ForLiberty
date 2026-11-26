@@ -172,6 +172,8 @@ export interface MealCombo {
   id: string;
   name: string;
   items: MealComboItem[];
+  /** 套餐默认餐次；单项 mealType 优先。未设置时按当前时间推断。 */
+  mealType?: MealType;
   createdAt?: string;
   updatedAt?: string;
 }

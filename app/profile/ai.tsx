@@ -30,6 +30,7 @@ import {
   subscribeJob,
   getJobSnapshot,
   clearJobResult,
+  cancelGeneration,
   type ToolActionEntry,
 } from "@/lib/ai/chat-engine";
 import { persistChatImages, deleteChatImages, toDataUriForRecognition } from "@/lib/ai/chat-images";
@@ -189,6 +190,8 @@ async function diagnoseNetworkError(msg: string, baseUrl?: string): Promise<stri
 
 // 待发送的图片：uri 是 data URI（base64），只放内存，不写进持久化消息。
 type PendingImage = { uri: string; name?: string; mimeType: string };
+// 发送前拦截：消息先停在这里，用户确认后才真正让 AI 生成回复；取消则完全不发送。
+type PendingSend = { text: string; images: PendingImage[]; targetId?: string };
 // 一次最多选 6 张：多图一起发给视觉模型，请求体太大会被网关/代理拒掉。
 const MAX_IMAGES = 6;
 const MAX_IMAGE_BYTES = 6 * 1024 * 1024;
@@ -279,6 +282,11 @@ export default function AIScreen() {
   const isLoading = job.running;
   const toolActions: ToolActionEntry[] = job.toolActions;
 
+  // 每一轮新生成重新展开操作面板；用户点 × 后本轮保持收起。
+  useEffect(() => {
+    if (job.startedAt) setShowToolActions(true);
+  }, [job.startedAt]);
+
   // 配置状态
   const [showConfig, setShowConfig] = useState(!state.aiConfig.isConfigured);
   const [provider, setProvider] = useState<AIProvider>(state.aiConfig.provider || "tokenhub");
@@ -302,6 +310,9 @@ export default function AIScreen() {
   // 对话状态
   const [inputText, setInputText] = useState("");
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
+  const [pendingSend, setPendingSend] = useState<PendingSend | null>(null);
+  // 「AI 本次操作」面板可收起，避免长列表挡住输入区。
+  const [showToolActions, setShowToolActions] = useState(true);
   // 长按气泡进入「选择文字」浮层：里面是纯文本，保证任何平台都能长按拖选片段。
   const [selectionTarget, setSelectionTarget] = useState<AIMessage | null>(null);
   // 点气泡才展开操作行，默认收起，聊天区更干净。
@@ -683,8 +694,36 @@ export default function AIScreen() {
     });
   }, [state.aiConfig.isConfigured, state.aiMessages, addAIMessage, updateAIMessage, setAIMessages, app]);
 
+  // 发送拦截：点发送后先停在确认卡片，用户可取消或改文字，确认后才真正调用 AI。
   const handleSendMessage = () => {
-    startGeneration(inputText.trim(), pendingImages);
+    if (isLoading) return;
+    const text = inputText.trim();
+    if (!text && pendingImages.length === 0) return;
+    setPendingSend({ text, images: pendingImages });
+    setInputText("");
+    setPendingImages([]);
+  };
+
+  const handleConfirmPendingSend = () => {
+    if (!pendingSend) return;
+    const { text, images, targetId } = pendingSend;
+    setPendingSend(null);
+    void startGeneration(text, images, targetId);
+  };
+
+  // 取消发送：丢弃这次编辑；「取回编辑」则把文字和图片放回输入框。
+  const handleCancelPendingSend = () => setPendingSend(null);
+
+  const handleRecallPendingSend = () => {
+    if (!pendingSend) return;
+    setPendingSend(null);
+    setInputText(pendingSend.text);
+    setPendingImages(pendingSend.images);
+  };
+
+  const handleCancelGeneration = () => {
+    cancelGeneration();
+    setPendingSend(null);
   };
 
 
@@ -763,7 +802,8 @@ export default function AIScreen() {
       mimeType: msg.images?.[i]?.mimeType || msg.image?.mimeType || "image/jpeg",
       name: msg.images?.[i]?.name || msg.image?.name,
     }));
-    startGeneration(msg.content || "", images, msg.id);
+    // 重新生成也走同一道拦截，用户仍可在真正请求前取消。
+    setPendingSend({ text: msg.content || "", images, targetId: msg.id });
   };
 
   const restoreOneMessage = (id: string) => {
@@ -1430,14 +1470,36 @@ export default function AIScreen() {
           </TouchableOpacity>
         )}
 
-        {/* 生成中提示：状态来自模块级引擎，切走页面仍在生成，回来就能看到 */}
+        {/* 生成中状态卡：可直接取消，不再只是一个干巴巴的文字条 */}
         {isLoading && (
           <View className="px-5 pb-2">
-            <View className="bg-surface rounded-2xl px-4 py-3 self-start border border-border flex-row items-center gap-2">
-              <ActivityIndicator size="small" color={colors.primary} />
-              <Text className="text-muted text-xs">
-                {job.turn > 0 ? `正在生成（第 ${job.turn} 轮）· 可以离开页面，完成后会通知你` : "正在理解你的问题…可以离开页面"}
-              </Text>
+            <View
+              className="rounded-2xl px-4 py-3 border"
+              style={{ backgroundColor: colors.primary + "12", borderColor: colors.primary + "40" }}
+            >
+              <View className="flex-row items-center">
+                <View
+                  className="w-8 h-8 rounded-full items-center justify-center mr-3"
+                  style={{ backgroundColor: colors.primary + "22" }}
+                >
+                  <ActivityIndicator size="small" color={colors.primary} />
+                </View>
+                <View className="flex-1">
+                  <Text className="text-foreground text-sm font-semibold">
+                    {job.turn > 0 ? `AI 正在生成 · 第 ${job.turn} 轮` : "AI 正在理解你的问题"}
+                  </Text>
+                  <Text className="text-muted text-xs mt-0.5">
+                    可以离开页面，完成后会通知你
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  onPress={handleCancelGeneration}
+                  className="rounded-full px-3 py-1.5 border border-border bg-background"
+                  activeOpacity={0.7}
+                >
+                  <Text className="text-error text-xs font-medium">取消生成</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           </View>
         )}
@@ -1445,36 +1507,128 @@ export default function AIScreen() {
         {/* 上一轮生成结果摘要（含后台完成 / 失败的反馈） */}
         {!isLoading && job.lastResult && (
           <View className="px-5 pb-2">
-            <TouchableOpacity
-              onPress={clearJobResult}
-              className={`rounded-xl px-4 py-2 self-start border ${
+            <View
+              className={`flex-row items-center rounded-xl px-3 py-2 border ${
                 job.lastResult.ok ? "bg-success/10 border-success/30" : "bg-error/10 border-error/30"
               }`}
-              activeOpacity={0.7}
             >
-              <Text className={`text-xs ${job.lastResult.ok ? "text-success" : "text-error"}`}>
+              <Text className={`flex-1 text-xs ${job.lastResult.ok ? "text-success" : "text-error"}`}>
                 {job.lastResult.ok ? "✓ " : "✕ "}
                 {job.lastResult.text}
-                {" · 点此关闭"}
               </Text>
+              <TouchableOpacity onPress={clearJobResult} className="ml-2 p-1" activeOpacity={0.7}>
+                <IconSymbol name="xmark" size={14} color={job.lastResult.ok ? colors.success : colors.error} />
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
+
+        {/* AI 本次对话实际执行的写操作：紧凑卡片 + 明确的关闭按钮 */}
+        {toolActions.length > 0 && showToolActions && (
+          <View className="px-5 pb-2">
+            <View className="rounded-2xl border border-border bg-surface overflow-hidden">
+              <View className="flex-row items-center px-3 py-2.5 border-b border-border">
+                <View
+                  className="w-6 h-6 rounded-full items-center justify-center mr-2"
+                  style={{ backgroundColor: colors.primary + "20" }}
+                >
+                  <IconSymbol name="checkmark.circle.fill" size={14} color={colors.primary} />
+                </View>
+                <Text className="flex-1 text-foreground text-sm font-semibold">
+                  AI 本次操作 · {toolActions.length} 项
+                </Text>
+                <TouchableOpacity
+                  onPress={() => setShowToolActions(false)}
+                  className="w-7 h-7 rounded-full items-center justify-center"
+                  style={{ backgroundColor: colors.background }}
+                  activeOpacity={0.7}
+                  accessibilityLabel="关闭本次操作面板"
+                >
+                  <IconSymbol name="xmark" size={14} color={colors.muted} />
+                </TouchableOpacity>
+              </View>
+              <ScrollView style={{ maxHeight: 132 }} contentContainerStyle={{ padding: 12 }}>
+                {toolActions.map((a, i) => (
+                  <View key={i} className="flex-row items-start mb-2">
+                    <View
+                      className="w-2 h-2 rounded-full mt-1.5 mr-2"
+                      style={{ backgroundColor: a.result.ok ? colors.success : colors.error }}
+                    />
+                    <Text className="text-foreground text-xs flex-1 leading-5">
+                      {a.result.summary}
+                    </Text>
+                  </View>
+                ))}
+              </ScrollView>
+            </View>
+          </View>
+        )}
+        {toolActions.length > 0 && !showToolActions && (
+          <View className="px-5 pb-2">
+            <TouchableOpacity
+              onPress={() => setShowToolActions(true)}
+              className="self-start rounded-full border border-border bg-surface px-3 py-1.5"
+              activeOpacity={0.7}
+            >
+              <Text className="text-muted text-xs">查看 AI 本次操作（{toolActions.length}）</Text>
             </TouchableOpacity>
           </View>
         )}
 
-        {/* AI 本次对话实际执行的写操作（透明展示） */}
-        {toolActions.length > 0 && (
-          <View className="px-5 py-2 border-t border-border bg-surface">
-            <Text className="text-muted text-xs mb-1">AI 本次操作：</Text>
-            {toolActions.map((a, i) => (
-              <View key={i} className="flex-row items-start mb-1">
-                <Text style={{ color: a.result.ok ? "#22c55e" : "#ef4444" }} className="mr-2">
-                  {a.result.ok ? "✅" : "❌"}
-                </Text>
-                <Text className="text-foreground text-xs" style={{ flex: 1 }}>
-                  {a.result.summary}
-                </Text>
+        {/* 发送前拦截卡：点发送后消息不会立刻进入对话，确认才发起 AI 请求 */}
+        {pendingSend && (
+          <View className="px-5 pt-3">
+            <View
+              className="rounded-2xl border p-3"
+              style={{ backgroundColor: colors.primary + "12", borderColor: colors.primary + "45" }}
+            >
+              <View className="flex-row items-center mb-2">
+                <View
+                  className="w-6 h-6 rounded-full items-center justify-center mr-2"
+                  style={{ backgroundColor: colors.primary + "22" }}
+                >
+                  <IconSymbol name="paperplane.fill" size={12} color={colors.primary} />
+                </View>
+                <View className="flex-1">
+                  <Text className="text-foreground text-sm font-semibold">发送前确认</Text>
+                  <Text className="text-muted text-xs">这条消息还没有发给 AI</Text>
+                </View>
+                <TouchableOpacity onPress={handleCancelPendingSend} className="p-1" activeOpacity={0.7}>
+                  <IconSymbol name="xmark" size={16} color={colors.muted} />
+                </TouchableOpacity>
               </View>
-            ))}
+              <ScrollView style={{ maxHeight: 88 }} className="mb-3">
+                <Text className="text-foreground text-sm leading-5">
+                  {pendingSend.text || (pendingSend.images.length ? "（仅图片，无文字）" : "")}
+                </Text>
+                {pendingSend.images.length > 0 && (
+                  <Text className="text-muted text-xs mt-1">附 {pendingSend.images.length} 张图片</Text>
+                )}
+              </ScrollView>
+              <View className="flex-row gap-2">
+                <TouchableOpacity
+                  onPress={handleRecallPendingSend}
+                  className="flex-1 rounded-xl border border-border bg-background py-2 items-center"
+                  activeOpacity={0.7}
+                >
+                  <Text className="text-foreground text-xs">取回编辑</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={handleCancelPendingSend}
+                  className="flex-1 rounded-xl border border-border bg-background py-2 items-center"
+                  activeOpacity={0.7}
+                >
+                  <Text className="text-error text-xs">取消</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  onPress={handleConfirmPendingSend}
+                  className="flex-1 rounded-xl bg-primary py-2 items-center"
+                  activeOpacity={0.8}
+                >
+                  <Text className="text-background text-xs font-semibold">确认发送</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
           </View>
         )}
 

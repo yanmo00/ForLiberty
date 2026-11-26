@@ -356,6 +356,7 @@ function normalizeMealCombo(raw: any): MealCombo | null {
     id: raw.id ?? generateId(),
     name: name || "未命名套餐",
     items,
+    mealType: MEAL_TYPES.includes(raw?.mealType) ? raw.mealType : undefined,
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
   };
